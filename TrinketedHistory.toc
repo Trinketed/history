@@ -1,0 +1,9 @@
+## Interface: 110207
+## Title: Trinketed - History
+## Notes: Arena match history and VOD timestamps
+## Author: apwek
+## Version: @project-version@
+## Dependencies: Trinketed
+## SavedVariables: TrinketedHistoryDB
+
+Core.lua
