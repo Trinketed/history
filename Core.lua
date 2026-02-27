@@ -759,6 +759,144 @@ local function GetCompKey(team)
     return table.concat(entries, "/")
 end
 
+---------------------------------------------------------------------------
+-- Session Computation
+---------------------------------------------------------------------------
+local SESSION_GAP_SECONDS = 3600  -- 60 minutes
+
+-- Build a sorted slash-separated key from the friendly team, excluding self.
+local function GetPartnerKey(game)
+    local me = UnitName("player")
+    local names = {}
+    for _, p in ipairs(game.friendlyTeam or {}) do
+        if p.name ~= me then
+            table.insert(names, p.name)
+        end
+    end
+    table.sort(names)
+    return table.concat(names, "/")
+end
+
+-- Group a games array into sessions based on time gaps and partner changes.
+-- bracketFilter: "2v2", "3v3", "5v5", or nil (all)
+-- daysFilter:    0 or nil = all time, 7/30/90 = last N days
+-- Returns an array of session objects sorted chronologically (oldest first).
+local function ComputeSessions(games, bracketFilter, daysFilter)
+    if not games or #games == 0 then return {} end
+
+    -- Determine cutoff timestamp for daysFilter
+    local cutoff = 0
+    if daysFilter and daysFilter > 0 then
+        cutoff = time() - (daysFilter * 86400)
+    end
+
+    -- Filter games
+    local filtered = {}
+    for _, g in ipairs(games) do
+        local dominated = true
+        if bracketFilter and g.bracket ~= bracketFilter then
+            dominated = false
+        end
+        if dominated and cutoff > 0 and (g.startTime or 0) < cutoff then
+            dominated = false
+        end
+        if dominated then
+            table.insert(filtered, g)
+        end
+    end
+
+    if #filtered == 0 then return {} end
+
+    -- Sort chronologically (oldest first)
+    table.sort(filtered, function(a, b)
+        return (a.startTime or 0) < (b.startTime or 0)
+    end)
+
+    -- Walk through filtered games and group into sessions
+    local sessions = {}
+    local cur = nil  -- current session being built
+
+    for _, g in ipairs(filtered) do
+        local pk = GetPartnerKey(g)
+        local needNew = false
+
+        if not cur then
+            needNew = true
+        else
+            local gap = (g.startTime or 0) - (cur.endTime or 0)
+            if gap > SESSION_GAP_SECONDS then
+                needNew = true
+            elseif pk ~= cur.partnerKey then
+                needNew = true
+            end
+        end
+
+        if needNew then
+            -- Finalise previous session if any (aggregates computed later)
+            if cur then
+                table.insert(sessions, cur)
+            end
+            cur = {
+                games     = {},
+                startTime = g.startTime,
+                endTime   = g.endTime,
+                bracket   = g.bracket,
+                partnerKey = pk,
+            }
+        else
+            -- Extend current session
+            cur.endTime = g.endTime
+            if cur.bracket ~= g.bracket then
+                cur.bracket = "Mixed"
+            end
+        end
+
+        table.insert(cur.games, g)
+    end
+
+    -- Don't forget the last session
+    if cur then
+        table.insert(sessions, cur)
+    end
+
+    -- Compute aggregates for each session
+    local me = UnitName("player")
+    for _, s in ipairs(sessions) do
+        local wins, losses = 0, 0
+        local totalRatingChange = 0
+
+        for _, g in ipairs(s.games) do
+            if g.result == "WIN" then
+                wins = wins + 1
+            elseif g.result == "LOSS" then
+                losses = losses + 1
+            end
+            totalRatingChange = totalRatingChange + (g.ratingChange or 0)
+        end
+
+        s.wins         = wins
+        s.losses       = losses
+        s.ratingChange = totalRatingChange
+        s.ratingStart  = s.games[1].ratingBefore
+        s.ratingEnd    = s.games[#s.games].ratingAfter
+
+        -- Collect unique partners (friendly team members excluding self)
+        local seen = {}
+        local partners = {}
+        for _, g in ipairs(s.games) do
+            for _, p in ipairs(g.friendlyTeam or {}) do
+                if p.name ~= me and not seen[p.name] then
+                    seen[p.name] = true
+                    table.insert(partners, { name = p.name, class = p.class })
+                end
+            end
+        end
+        s.partners = partners
+    end
+
+    return sessions
+end
+
 local function GameMatchesFilters(game)
     if filters.result and game.result ~= filters.result then
         return false
