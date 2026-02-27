@@ -1959,6 +1959,443 @@ function RefreshHistory()
     RefreshStats(filtered)
 end
 
+---------------------------------------------------------------------------
+-- Sessions Tab Content
+---------------------------------------------------------------------------
+local sessionFilters = {
+    bracket = "All",
+    days = 0,
+}
+
+local sessionBracketDD = CreateSearchableDropdown(sessionsContainer, "TkSBracketDD", 120, {
+    defaultLabel = "Bracket: All",
+    getOptions = function()
+        local out = {}
+        local brackets = { "2v2", "3v3", "5v5" }
+        for _, b in ipairs(brackets) do
+            table.insert(out, {
+                key = b,
+                text = b,
+                searchText = b:lower(),
+                isChecked = function() return sessionFilters.bracket == b end,
+            })
+        end
+        return out
+    end,
+    onToggle = function(key)
+        if sessionFilters.bracket == key then
+            sessionFilters.bracket = "All"
+        else
+            sessionFilters.bracket = key
+        end
+        if RefreshSessions then RefreshSessions() end
+    end,
+    onClear = function()
+        sessionFilters.bracket = "All"
+        if RefreshSessions then RefreshSessions() end
+    end,
+    getLabel = function()
+        if sessionFilters.bracket == "All" then return "Bracket: All" end
+        return "Bracket: " .. sessionFilters.bracket
+    end,
+})
+sessionBracketDD.frame:SetPoint("TOPLEFT", sessionsContainer, "TOPLEFT", 12, -24)
+
+local sessionDaysDD = CreateSearchableDropdown(sessionsContainer, "TkSDaysDD", 120, {
+    defaultLabel = "Time: All",
+    getOptions = function()
+        local out = {}
+        local dayOpts = {
+            { key = "7",  text = "Last 7 Days" },
+            { key = "30", text = "Last 30 Days" },
+            { key = "90", text = "Last 90 Days" },
+        }
+        for _, d in ipairs(dayOpts) do
+            table.insert(out, {
+                key = d.key,
+                text = d.text,
+                searchText = d.text:lower(),
+                isChecked = function() return sessionFilters.days == tonumber(d.key) end,
+            })
+        end
+        return out
+    end,
+    onToggle = function(key)
+        local val = tonumber(key)
+        if sessionFilters.days == val then
+            sessionFilters.days = 0
+        else
+            sessionFilters.days = val
+        end
+        if RefreshSessions then RefreshSessions() end
+    end,
+    onClear = function()
+        sessionFilters.days = 0
+        if RefreshSessions then RefreshSessions() end
+    end,
+    getLabel = function()
+        if sessionFilters.days == 0 then return "Time: All" end
+        return "Last " .. sessionFilters.days .. " Days"
+    end,
+})
+sessionDaysDD.frame:SetPoint("LEFT", sessionBracketDD.frame, "RIGHT", 10, 0)
+
+-- Session column headers
+local sessionHeaderY = -54
+local sessionHeaders = {
+    { text = "#",        x = 4,   w = 24,  justify = "RIGHT" },
+    { text = "Date",     x = 32,  w = 100, justify = "LEFT" },
+    { text = "Partners", x = 136, w = 160, justify = "LEFT" },
+    { text = "Bracket",  x = 300, w = 50,  justify = "CENTER" },
+    { text = "Games",    x = 355, w = 40,  justify = "CENTER" },
+    { text = "W-L",      x = 400, w = 50,  justify = "CENTER" },
+    { text = "Win%",     x = 455, w = 45,  justify = "CENTER" },
+    { text = "Rating",   x = 505, w = 120, justify = "CENTER" },
+    { text = "Net",      x = 630, w = 50,  justify = "CENTER" },
+}
+for _, h in ipairs(sessionHeaders) do
+    if h.text ~= "" then
+        local fs = sessionsContainer:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        fs:SetPoint("TOPLEFT", h.x, sessionHeaderY)
+        fs:SetWidth(h.w)
+        fs:SetJustifyH(h.justify)
+        fs:SetWordWrap(false)
+        fs:SetText("|cff888888" .. h.text .. "|r")
+    end
+end
+
+-- Thin separator line below session headers
+local sessHeaderSep = sessionsContainer:CreateTexture(nil, "ARTWORK")
+sessHeaderSep:SetHeight(1)
+sessHeaderSep:SetPoint("TOPLEFT", 4, sessionHeaderY - 12)
+sessHeaderSep:SetPoint("TOPRIGHT", -16, sessionHeaderY - 12)
+sessHeaderSep:SetColorTexture(0.4, 0.4, 0.4, 0.5)
+
+-- Sessions scroll frame
+local sessScrollFrame = CreateFrame("ScrollFrame", nil, sessionsContainer, "UIPanelScrollFrameTemplate")
+sessScrollFrame:SetPoint("TOPLEFT", 10, sessionHeaderY - 14)
+sessScrollFrame:SetPoint("BOTTOMRIGHT", -30, 10)
+
+local sessContent = CreateFrame("Frame", nil, sessScrollFrame)
+sessContent:SetSize(740, 1)
+sessScrollFrame:SetScrollChild(sessContent)
+
+local SESSION_ROW_HEIGHT = 28
+local MATCH_ROW_HEIGHT = 26
+local sessionRowPool = {}
+local expandedSession = nil
+
+---------------------------------------------------------------------------
+-- RefreshSessions
+---------------------------------------------------------------------------
+function RefreshSessions()
+    -- Recycle existing rows
+    for _, row in ipairs(sessionRowPool) do
+        row:Hide()
+    end
+
+    local allGames = TrinketedHistoryDB and TrinketedHistoryDB.games or {}
+
+    -- Build filter args
+    local bracketFilter = sessionFilters.bracket ~= "All" and sessionFilters.bracket or nil
+    local daysFilter = sessionFilters.days
+
+    local sessions = ComputeSessions(allGames, bracketFilter, daysFilter)
+
+    local totalHeight = 0
+    local rowIdx = 0
+    local totalGames = 0
+    local totalWins = 0
+    local totalLosses = 0
+    local totalNetRating = 0
+    local hasRating = false
+
+    -- Render sessions newest-first
+    local displayNum = 0
+    for si = #sessions, 1, -1 do
+        displayNum = displayNum + 1
+        local s = sessions[si]
+        rowIdx = rowIdx + 1
+
+        totalGames = totalGames + #s.games
+        totalWins = totalWins + s.wins
+        totalLosses = totalLosses + s.losses
+        totalNetRating = totalNetRating + s.ratingChange
+        if s.ratingStart or s.ratingEnd then hasRating = true end
+
+        -- Create or reuse session row (Button for clickability)
+        local row = sessionRowPool[rowIdx]
+        if not row then
+            row = CreateFrame("Button", nil, sessContent)
+            row:SetSize(740, SESSION_ROW_HEIGHT)
+            sessionRowPool[rowIdx] = row
+
+            row.index = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.index:SetPoint("LEFT", 4, 0)
+            row.index:SetWidth(24)
+            row.index:SetJustifyH("RIGHT")
+
+            row.dateStr = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.dateStr:SetPoint("LEFT", 32, 0)
+            row.dateStr:SetWidth(100)
+            row.dateStr:SetJustifyH("LEFT")
+            row.dateStr:SetWordWrap(false)
+
+            row.partners = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.partners:SetPoint("LEFT", 136, 0)
+            row.partners:SetWidth(160)
+            row.partners:SetJustifyH("LEFT")
+            row.partners:SetWordWrap(false)
+
+            row.bracket = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.bracket:SetPoint("LEFT", 300, 0)
+            row.bracket:SetWidth(50)
+            row.bracket:SetJustifyH("CENTER")
+
+            row.games = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.games:SetPoint("LEFT", 355, 0)
+            row.games:SetWidth(40)
+            row.games:SetJustifyH("CENTER")
+
+            row.wl = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.wl:SetPoint("LEFT", 400, 0)
+            row.wl:SetWidth(50)
+            row.wl:SetJustifyH("CENTER")
+
+            row.winPct = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.winPct:SetPoint("LEFT", 455, 0)
+            row.winPct:SetWidth(45)
+            row.winPct:SetJustifyH("CENTER")
+
+            row.rating = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.rating:SetPoint("LEFT", 505, 0)
+            row.rating:SetWidth(120)
+            row.rating:SetJustifyH("CENTER")
+            row.rating:SetWordWrap(false)
+
+            row.net = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.net:SetPoint("LEFT", 630, 0)
+            row.net:SetWidth(50)
+            row.net:SetJustifyH("CENTER")
+
+            row.expandIndicator = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.expandIndicator:SetPoint("RIGHT", -4, 0)
+            row.expandIndicator:SetWidth(16)
+            row.expandIndicator:SetJustifyH("CENTER")
+
+            row.bg = row:CreateTexture(nil, "BACKGROUND")
+            row.bg:SetAllPoints()
+
+            -- Highlight on hover
+            local hl = row:CreateTexture(nil, "HIGHLIGHT")
+            hl:SetAllPoints()
+            hl:SetColorTexture(1, 1, 1, 0.05)
+        end
+
+        row:SetPoint("TOPLEFT", 0, -totalHeight)
+
+        -- Alternating row color
+        if displayNum % 2 == 0 then
+            row.bg:SetColorTexture(1, 1, 1, 0.05)
+        else
+            row.bg:SetColorTexture(0, 0, 0, 0)
+        end
+
+        row.index:SetText("#" .. displayNum)
+        row.index:SetTextColor(0.5, 0.5, 0.5)
+
+        row.dateStr:SetText(date("%m/%d %H:%M", s.startTime))
+        row.dateStr:SetTextColor(0.7, 0.7, 0.7)
+
+        -- Partners: class-colored names joined by ", " or "Solo"
+        if s.partners and #s.partners > 0 then
+            local pParts = {}
+            for _, p in ipairs(s.partners) do
+                local color = CLASS_COLORS[p.class] or "ffffffff"
+                table.insert(pParts, "|c" .. color .. p.name .. "|r")
+            end
+            row.partners:SetText(table.concat(pParts, ", "))
+        else
+            row.partners:SetText("|cff888888Solo|r")
+        end
+
+        row.bracket:SetText(s.bracket or "?")
+        row.bracket:SetTextColor(0.9, 0.9, 0.9)
+
+        row.games:SetText(#s.games)
+        row.games:SetTextColor(0.9, 0.9, 0.9)
+
+        row.wl:SetText("|cff00ff00" .. s.wins .. "|r-|cffff0000" .. s.losses .. "|r")
+
+        -- Win% with color gradient: red at 0%, yellow at 50%, green at 100%
+        local totalSGames = s.wins + s.losses
+        local pct = (totalSGames > 0) and (s.wins / totalSGames * 100) or 0
+        local pr, pg
+        if pct <= 50 then
+            pr = 1
+            pg = pct / 50
+        else
+            pr = 1 - (pct - 50) / 50
+            pg = 1
+        end
+        local pctHex = string.format("|cff%02x%02x00%d%%|r",
+            math.floor(pr * 255 + 0.5), math.floor(pg * 255 + 0.5), math.floor(pct + 0.5))
+        row.winPct:SetText(pctHex)
+
+        -- Rating: startRating -> endRating
+        if s.ratingStart and s.ratingEnd then
+            row.rating:SetText("|cffcccccc" .. s.ratingStart .. " → " .. s.ratingEnd .. "|r")
+        else
+            row.rating:SetText("|cff555555—|r")
+        end
+
+        -- Net rating change
+        if s.ratingChange and s.ratingChange ~= 0 then
+            local sign = s.ratingChange >= 0 and "+" or ""
+            local netColor = s.ratingChange >= 0 and "|cff00ff00" or "|cffff0000"
+            row.net:SetText(netColor .. sign .. s.ratingChange .. "|r")
+        elseif s.ratingStart or s.ratingEnd then
+            row.net:SetText("|cff888888" .. "0" .. "|r")
+        else
+            row.net:SetText("|cff555555—|r")
+        end
+
+        -- Expand indicator
+        local isExpanded = (expandedSession == si)
+        row.expandIndicator:SetText(isExpanded and "▼" or "▶")
+        row.expandIndicator:SetTextColor(0.5, 0.5, 0.5)
+
+        -- OnClick: toggle drill-down
+        local capturedSi = si
+        row:SetScript("OnClick", function()
+            if expandedSession == capturedSi then
+                expandedSession = nil
+            else
+                expandedSession = capturedSi
+            end
+            RefreshSessions()
+        end)
+
+        row:Show()
+        totalHeight = totalHeight + SESSION_ROW_HEIGHT
+
+        -- Drill-down: render individual games if this session is expanded
+        if isExpanded then
+            for gi, game in ipairs(s.games) do
+                rowIdx = rowIdx + 1
+                local mrow = sessionRowPool[rowIdx]
+                if not mrow then
+                    mrow = CreateFrame("Frame", nil, sessContent)
+                    mrow:SetSize(740, MATCH_ROW_HEIGHT)
+                    sessionRowPool[rowIdx] = mrow
+
+                    mrow.result = mrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                    mrow.result:SetPoint("LEFT", 40, 0)
+                    mrow.result:SetWidth(30)
+                    mrow.result:SetJustifyH("LEFT")
+
+                    mrow.friendly = mrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                    mrow.friendly:SetPoint("LEFT", 74, 0)
+                    mrow.friendly:SetWidth(120)
+                    mrow.friendly:SetJustifyH("LEFT")
+                    mrow.friendly:SetWordWrap(false)
+
+                    mrow.vs = mrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                    mrow.vs:SetPoint("LEFT", 198, 0)
+                    mrow.vs:SetWidth(20)
+                    mrow.vs:SetJustifyH("CENTER")
+
+                    mrow.enemy = mrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                    mrow.enemy:SetPoint("LEFT", 222, 0)
+                    mrow.enemy:SetWidth(120)
+                    mrow.enemy:SetJustifyH("LEFT")
+                    mrow.enemy:SetWordWrap(false)
+
+                    mrow.ratingChg = mrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                    mrow.ratingChg:SetPoint("LEFT", 350, 0)
+                    mrow.ratingChg:SetWidth(50)
+                    mrow.ratingChg:SetJustifyH("CENTER")
+
+                    mrow.duration = mrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                    mrow.duration:SetPoint("LEFT", 410, 0)
+                    mrow.duration:SetWidth(45)
+                    mrow.duration:SetJustifyH("CENTER")
+
+                    mrow.timeStr = mrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                    mrow.timeStr:SetPoint("LEFT", 465, 0)
+                    mrow.timeStr:SetWidth(60)
+                    mrow.timeStr:SetJustifyH("RIGHT")
+
+                    mrow.bg = mrow:CreateTexture(nil, "BACKGROUND")
+                    mrow.bg:SetAllPoints()
+                end
+
+                mrow:SetPoint("TOPLEFT", 0, -totalHeight)
+                mrow.bg:SetColorTexture(0.08, 0.08, 0.12, 0.8)
+
+                -- Result
+                if game.result == "WIN" then
+                    mrow.result:SetText("|cff00ff00W|r")
+                else
+                    mrow.result:SetText("|cffff0000L|r")
+                end
+
+                -- Friendly team classes
+                mrow.friendly:SetText(FormatTeamClasses(game.friendlyTeam) or "?")
+
+                mrow.vs:SetText("|cff666666vs|r")
+
+                -- Enemy team classes
+                local enemyClasses = FormatTeamClasses(game.enemyTeam)
+                if not enemyClasses and game.enemyComp then
+                    local parts = {}
+                    for _, class in ipairs(game.enemyComp) do
+                        table.insert(parts, ColorClass(class))
+                    end
+                    enemyClasses = #parts > 0 and table.concat(parts, " ") or "?"
+                end
+                mrow.enemy:SetText(enemyClasses or "?")
+
+                -- Rating change
+                if game.ratingChange then
+                    local sign = game.ratingChange >= 0 and "+" or ""
+                    local chgColor = game.ratingChange >= 0 and "|cff00ff00" or "|cffff0000"
+                    mrow.ratingChg:SetText(chgColor .. sign .. game.ratingChange .. "|r")
+                else
+                    mrow.ratingChg:SetText("|cff555555—|r")
+                end
+
+                -- Duration
+                local dur = (game.startTime and game.endTime) and (game.endTime - game.startTime) or nil
+                mrow.duration:SetText(FormatDuration(dur))
+                mrow.duration:SetTextColor(0.8, 0.8, 0.8)
+
+                -- Time
+                mrow.timeStr:SetText(FormatTime(game.startTime))
+                mrow.timeStr:SetTextColor(0.6, 0.6, 0.6)
+
+                mrow:Show()
+                totalHeight = totalHeight + MATCH_ROW_HEIGHT
+            end
+        end
+    end
+
+    sessContent:SetHeight(math.max(totalHeight, 1))
+
+    -- Update title with session/game counts and net rating
+    local sessionCount = #sessions
+    local countStr = sessionCount .. " session" .. (sessionCount ~= 1 and "s" or "") ..
+        ", " .. totalGames .. " game" .. (totalGames ~= 1 and "s" or "")
+    local ratingStr = ""
+    if hasRating then
+        local sign = totalNetRating >= 0 and "+" or ""
+        local color = totalNetRating >= 0 and "|cff00ff00" or "|cffff0000"
+        ratingStr = " | Net: " .. color .. sign .. totalNetRating .. "|r"
+    end
+    historyFrame.title:SetText("Trinketed — " .. countStr .. " (" ..
+        "|cff00ff00" .. totalWins .. "W|r / |cffff0000" .. totalLosses .. "L|r)" .. ratingStr)
+end
+
 local function ToggleHistory()
     if historyFrame:IsShown() then
         historyFrame:Hide()
