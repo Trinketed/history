@@ -1115,6 +1115,7 @@ local sessionsTab = CreateTab(historyFrame, "Sessions", "sessions")
 sessionsTab:SetPoint("LEFT", matchesTab, "RIGHT", 4, 0)
 
 -- Forward declarations for tab refresh functions
+local RefreshHistory
 local RefreshSessions
 
 local function UpdateTabAppearance()
@@ -1149,9 +1150,6 @@ matchesTab:SetScript("OnClick", function() SwitchTab("matches") end)
 sessionsTab:SetScript("OnClick", function() SwitchTab("sessions") end)
 
 UpdateTabAppearance()
-
--- Forward declare RefreshHistory so filter widgets can call it
-local RefreshHistory
 
 -- Format a comp key ("Disc Priest/Arms Warrior") into class-colored text
 local function FormatCompLabel(compKey)
@@ -2083,7 +2081,7 @@ sessScrollFrame:SetScrollChild(sessContent)
 local SESSION_ROW_HEIGHT = 28
 local MATCH_ROW_HEIGHT = 26
 local sessionRowPool = {}
-local expandedSession = nil
+local expandedSession = nil -- stores startTime of expanded session for stable identity
 
 ---------------------------------------------------------------------------
 -- RefreshSessions
@@ -2261,17 +2259,17 @@ function RefreshSessions()
         end
 
         -- Expand indicator
-        local isExpanded = (expandedSession == si)
+        local isExpanded = (expandedSession == s.startTime)
         row.expandIndicator:SetText(isExpanded and "▼" or "▶")
         row.expandIndicator:SetTextColor(0.5, 0.5, 0.5)
 
-        -- OnClick: toggle drill-down
-        local capturedSi = si
+        -- OnClick: toggle drill-down (use startTime as stable identity)
+        local capturedStartTime = s.startTime
         row:SetScript("OnClick", function()
-            if expandedSession == capturedSi then
+            if expandedSession == capturedStartTime then
                 expandedSession = nil
             else
-                expandedSession = capturedSi
+                expandedSession = capturedStartTime
             end
             RefreshSessions()
         end)
