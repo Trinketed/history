@@ -6,6 +6,7 @@ TrinketedHistory = TrinketedHistory or {}
 local addon = TrinketedHistory
 
 local lib = LibStub("TrinketedLib-1.0")
+local C = lib.C
 
 ---------------------------------------------------------------------------
 -- Constants
@@ -173,6 +174,17 @@ local snapshotTicker = nil -- periodic re-snapshot timer handle
 local needsReload = false  -- set after a game is saved, triggers reload on next queue
 local pendingSave = nil    -- set to "WIN"/"LOSS" when match ends, cleared after save
 local UpdateOverlayVisibility  -- forward declaration
+
+-- Sessions tab state
+local activeTab = "sessions"
+local sessionCollapsed = {}         -- sessionStartTime → boolean
+local sessionHeaderPool = {}
+local sessionMatchRowPool = {}
+local SESSION_HEADER_HEIGHT = 38
+
+-- Shared UI state for options-panel-embedded tabs
+local ui = {}           -- History tab UI references (including stats sub-tab)
+local lastFilteredList = {}  -- populated by RefreshHistory, consumed by RefreshStats
 
 ---------------------------------------------------------------------------
 -- Debug
@@ -910,25 +922,57 @@ local ShowExportDialog
 local ShowImportDialog
 
 ---------------------------------------------------------------------------
--- History Window
+-- History UI (embedded in Options Panel)
 ---------------------------------------------------------------------------
-local historyFrame = CreateFrame("Frame", "TrinketedHistoryFrame", UIParent, "BasicFrameTemplateWithInset")
-historyFrame:SetSize(800, 560)
-historyFrame:SetPoint("CENTER")
-historyFrame:SetFrameStrata("DIALOG")
-historyFrame:SetMovable(true)
-historyFrame:EnableMouse(true)
-historyFrame:RegisterForDrag("LeftButton")
-historyFrame:SetScript("OnDragStart", historyFrame.StartMoving)
-historyFrame:SetScript("OnDragStop", historyFrame.StopMovingOrSizing)
-historyFrame:Hide()
-
-historyFrame.title = historyFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-historyFrame.title:SetPoint("TOP", 0, -5)
-historyFrame.title:SetText("Trinketed — Arena History")
-
 -- Forward declare RefreshHistory so filter widgets can call it
 local RefreshHistory
+local RefreshStats
+
+-- Tab buttons: Sessions | History | Stats
+local function CreateTabButton(parent, label, x)
+    local btn = CreateFrame("Button", nil, parent)
+    btn:SetSize(80, 20)
+    btn:SetPoint("TOPLEFT", x, -24)
+
+    btn.bg = btn:CreateTexture(nil, "BACKGROUND")
+    btn.bg:SetAllPoints()
+    btn.bg:SetColorTexture(unpack(C.sidebarBg))
+
+    btn.text = btn:CreateFontString(nil, "OVERLAY")
+    btn.text:SetFont(lib.FONT_BODY, 11, "")
+    btn.text:SetPoint("CENTER", 0, 0)
+    btn.text:SetText(label)
+    btn.text:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
+
+    btn.underline = btn:CreateTexture(nil, "ARTWORK")
+    btn.underline:SetHeight(2)
+    btn.underline:SetPoint("BOTTOMLEFT", 0, 0)
+    btn.underline:SetPoint("BOTTOMRIGHT", 0, 0)
+    btn.underline:SetColorTexture(C.accent[1], C.accent[2], C.accent[3], 1)
+    btn.underline:Hide()
+
+    return btn
+end
+
+local function SetActiveTab(tab)
+    activeTab = tab
+    if not ui.sessionsTabBtn then return end
+    local tabs = { ui.sessionsTabBtn, ui.historyTabBtn, ui.statsTabBtn }
+    local activeKey = { sessions = 1, history = 2, stats = 3 }
+    local activeIdx = activeKey[tab] or 1
+    for i, btn in ipairs(tabs) do
+        if i == activeIdx then
+            btn.bg:SetColorTexture(unpack(C.tabActive))
+            btn.underline:Show()
+            btn.text:SetTextColor(C.accent[1], C.accent[2], C.accent[3])
+        else
+            btn.bg:SetColorTexture(unpack(C.sidebarBg))
+            btn.underline:Hide()
+            btn.text:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
+        end
+    end
+    if RefreshHistory then RefreshHistory() end
+end
 
 -- Format a comp key ("Disc Priest/Arms Warrior") into class-colored text
 local function FormatCompLabel(compKey)
@@ -966,14 +1010,15 @@ local function CreateSearchableDropdown(parent, ddName, width, opts)
 
     local btnBg = btn:CreateTexture(nil, "BACKGROUND")
     btnBg:SetAllPoints()
-    btnBg:SetColorTexture(0.1, 0.1, 0.1, 1)
+    btnBg:SetColorTexture(unpack(C.sidebarBg))
 
     local bdr = CreateFrame("Frame", nil, btn, "BackdropTemplate")
     bdr:SetAllPoints()
     bdr:SetBackdrop({ edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border", edgeSize = 12, insets = { left = 2, right = 2, top = 2, bottom = 2 } })
-    bdr:SetBackdropBorderColor(0.5, 0.5, 0.5, 0.8)
+    bdr:SetBackdropBorderColor(C.borderDefault[1], C.borderDefault[2], C.borderDefault[3], C.borderDefault[4] or 1)
 
-    local lbl = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    local lbl = btn:CreateFontString(nil, "OVERLAY")
+    lbl:SetFont(lib.FONT_BODY, 10, "")
     lbl:SetPoint("LEFT", 6, 0)
     lbl:SetPoint("RIGHT", -16, 0)
     lbl:SetJustifyH("LEFT")
@@ -1004,20 +1049,21 @@ local function CreateSearchableDropdown(parent, ddName, width, opts)
     -- Manual solid background texture
     local popBg = popup:CreateTexture(nil, "BACKGROUND")
     popBg:SetAllPoints()
-    popBg:SetColorTexture(0.05, 0.05, 0.05, 1)
-    popup:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
+    popBg:SetColorTexture(C.frameBg[1], C.frameBg[2], C.frameBg[3], C.frameBg[4])
+    popup:SetBackdropBorderColor(C.borderDefault[1], C.borderDefault[2], C.borderDefault[3], C.borderDefault[4] or 1)
     popup:Hide()
 
     -- "Clear All" button
     local clrBtn = CreateFrame("Button", nil, popup)
     clrBtn:SetSize(width + 10, SD_ROW_H)
     clrBtn:SetPoint("TOPLEFT", 5, -5)
-    local clrTxt = clrBtn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    local clrTxt = clrBtn:CreateFontString(nil, "OVERLAY")
+    clrTxt:SetFont(lib.FONT_BODY, 10, "")
     clrTxt:SetPoint("LEFT", 4, 0)
     clrTxt:SetText("|cffaaaaaaAll (clear)|r")
     local clrHL = clrBtn:CreateTexture(nil, "HIGHLIGHT")
     clrHL:SetAllPoints()
-    clrHL:SetColorTexture(1, 1, 1, 0.1)
+    clrHL:SetColorTexture(C.rowHover[1], C.rowHover[2], C.rowHover[3], C.rowHover[4])
     clrBtn:SetScript("OnClick", function()
         if opts.onClear then opts.onClear() end
         dd:Refresh()
@@ -1028,8 +1074,10 @@ local function CreateSearchableDropdown(parent, ddName, width, opts)
     sBox:SetSize(width + 4, 18)
     sBox:SetPoint("TOPLEFT", 8, -5 - SD_ROW_H - 2)
     sBox:SetAutoFocus(false)
-    sBox:SetFontObject("GameFontNormalSmall")
-    local sPH = sBox:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+    sBox:SetFont(lib.FONT_BODY, 10, "")
+    local sPH = sBox:CreateFontString(nil, "ARTWORK")
+    sPH:SetFont(lib.FONT_BODY, 10, "")
+    sPH:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
     sPH:SetPoint("LEFT", 5, 0)
     sPH:SetText("Search...")
     sBox:SetScript("OnEditFocusGained", function() sPH:Hide() end)
@@ -1053,11 +1101,12 @@ local function CreateSearchableDropdown(parent, ddName, width, opts)
         r:SetSize(width - 10, SD_ROW_H)
         local hl = r:CreateTexture(nil, "HIGHLIGHT")
         hl:SetAllPoints()
-        hl:SetColorTexture(1, 1, 1, 0.1)
+        hl:SetColorTexture(C.rowHover[1], C.rowHover[2], C.rowHover[3], C.rowHover[4])
         r.chk = r:CreateTexture(nil, "OVERLAY")
         r.chk:SetSize(12, 12)
         r.chk:SetPoint("LEFT", 2, 0)
-        r.txt = r:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        r.txt = r:CreateFontString(nil, "OVERLAY")
+        r.txt:SetFont(lib.FONT_BODY, 10, "")
         r.txt:SetPoint("LEFT", 18, 0)
         r.txt:SetPoint("RIGHT", -2, 0)
         r.txt:SetJustifyH("LEFT")
@@ -1129,282 +1178,84 @@ local function CreateSearchableDropdown(parent, ddName, width, opts)
     btn:SetScript("OnClick", function()
         if popup:IsShown() then dd:Close() else dd:Open() end
     end)
-    btn:SetScript("OnEnter", function() btnBg:SetColorTexture(0.15, 0.15, 0.15, 1) end)
-    btn:SetScript("OnLeave", function() btnBg:SetColorTexture(0.1, 0.1, 0.1, 1) end)
+    btn:SetScript("OnEnter", function() btnBg:SetColorTexture(C.tabHover[1], C.tabHover[2], C.tabHover[3], C.tabHover[4] or 1) end)
+    btn:SetScript("OnLeave", function() btnBg:SetColorTexture(unpack(C.sidebarBg)) end)
 
     return dd
 end
 
----------------------------------------------------------------------------
--- Filter Row 1: Player Comp | Partner | Enemy Comp
----------------------------------------------------------------------------
-local friendlyCompDD = CreateSearchableDropdown(historyFrame, "TkCompDD", 155, {
-    defaultLabel = "Player Comp: All",
-    getOptions = function()
-        local out = {}
-        for _, comp in ipairs(CollectUniqueComps("friendlyTeam")) do
-            table.insert(out, { key = comp, text = FormatCompLabel(comp), searchText = comp:lower():gsub("/", " "), isChecked = function() return filters.friendlyComps[comp] == true end })
-        end
-        return out
-    end,
-    onToggle = function(key)
-        if filters.friendlyComps[key] then filters.friendlyComps[key] = nil else filters.friendlyComps[key] = true end
-        filters.partners = {}
-        RefreshHistory()
-    end,
-    onClear = function() filters.friendlyComps = {}; filters.partners = {}; RefreshHistory() end,
-    getLabel = function()
-        if not next(filters.friendlyComps) then return "Player Comp: All" end
-        local t = {}; for c in pairs(filters.friendlyComps) do table.insert(t, FormatCompLabel(c)) end
-        return "Player Comp: " .. table.concat(t, ", ")
-    end,
-})
-friendlyCompDD.frame:SetPoint("TOPLEFT", 12, -28)
+-- (Filter dropdowns created inside BuildHistoryUI)
 
-local partnerDD = CreateSearchableDropdown(historyFrame, "TkPartDD", 155, {
-    defaultLabel = "Partner: All",
-    getOptions = function()
-        local out = {}
-        for _, p in ipairs(CollectUniquePartners()) do
-            local color = CLASS_COLORS[p.class] or "ffffffff"
-            table.insert(out, { key = p.name, text = "|c" .. color .. p.name .. "|r", searchText = p.name:lower(), isChecked = function() return filters.partners[p.name] == true end })
-        end
-        return out
-    end,
-    onToggle = function(key)
-        if filters.partners[key] then filters.partners[key] = nil else filters.partners[key] = true end
-        RefreshHistory()
-    end,
-    onClear = function() filters.partners = {}; RefreshHistory() end,
-    getLabel = function()
-        if not next(filters.partners) then return "Partner: All" end
-        local t = {}; for n in pairs(filters.partners) do table.insert(t, n) end
-        return "Partner: " .. table.concat(t, ", ")
-    end,
-})
-partnerDD.frame:SetPoint("TOPLEFT", 177, -28)
-
-local enemyCompDD = CreateSearchableDropdown(historyFrame, "TkECompDD", 155, {
-    defaultLabel = "Enemy Comp: All",
-    getOptions = function()
-        local out = {}
-        for _, comp in ipairs(CollectUniqueComps("enemyTeam")) do
-            table.insert(out, { key = comp, text = FormatCompLabel(comp), searchText = comp:lower():gsub("/", " "), isChecked = function() return filters.enemyComps[comp] == true end })
-        end
-        return out
-    end,
-    onToggle = function(key)
-        if filters.enemyComps[key] then filters.enemyComps[key] = nil else filters.enemyComps[key] = true end
-        filters.enemyPlayers = {}; filters.enemyRaces = {}
-        RefreshHistory()
-    end,
-    onClear = function() filters.enemyComps = {}; filters.enemyPlayers = {}; filters.enemyRaces = {}; RefreshHistory() end,
-    getLabel = function()
-        if not next(filters.enemyComps) then return "Enemy Comp: All" end
-        local t = {}; for c in pairs(filters.enemyComps) do table.insert(t, FormatCompLabel(c)) end
-        return "Enemy Comp: " .. table.concat(t, ", ")
-    end,
-})
-enemyCompDD.frame:SetPoint("TOPLEFT", 342, -28)
-
----------------------------------------------------------------------------
--- Filter Row 2: Enemy Players | Enemy Race | Result | Reset
----------------------------------------------------------------------------
-local enemyPlayerDD = CreateSearchableDropdown(historyFrame, "TkEPlrDD", 155, {
-    defaultLabel = "Enemy Players: All",
-    getOptions = function()
-        local out = {}
-        for _, p in ipairs(CollectUniqueEnemyPlayers()) do
-            local color = CLASS_COLORS[p.class] or "ffffffff"
-            table.insert(out, { key = p.name, text = "|c" .. color .. p.name .. "|r", searchText = p.name:lower(), isChecked = function() return filters.enemyPlayers[p.name] == true end })
-        end
-        return out
-    end,
-    onToggle = function(key)
-        if filters.enemyPlayers[key] then filters.enemyPlayers[key] = nil else filters.enemyPlayers[key] = true end
-        RefreshHistory()
-    end,
-    onClear = function() filters.enemyPlayers = {}; RefreshHistory() end,
-    getLabel = function()
-        if not next(filters.enemyPlayers) then return "Enemy Players: All" end
-        local t = {}; for n in pairs(filters.enemyPlayers) do table.insert(t, n) end
-        return "Enemy Players: " .. table.concat(t, ", ")
-    end,
-})
-enemyPlayerDD.frame:SetPoint("TOPLEFT", 12, -54)
-
-local enemyRaceDD = CreateSearchableDropdown(historyFrame, "TkERaceDD", 155, {
-    defaultLabel = "Race: All",
-    getOptions = function()
-        local out = {}
-        for _, race in ipairs(CollectUniqueEnemyRaces()) do
-            table.insert(out, { key = race, text = race, searchText = race:lower(), isChecked = function() return filters.enemyRaces[race] == true end })
-        end
-        return out
-    end,
-    onToggle = function(key)
-        if filters.enemyRaces[key] then filters.enemyRaces[key] = nil else filters.enemyRaces[key] = true end
-        RefreshHistory()
-    end,
-    onClear = function() filters.enemyRaces = {}; RefreshHistory() end,
-    getLabel = function()
-        if not next(filters.enemyRaces) then return "Race: All" end
-        local t = {}; for r in pairs(filters.enemyRaces) do table.insert(t, r) end
-        return "Race: " .. table.concat(t, ", ")
-    end,
-})
-enemyRaceDD.frame:SetPoint("TOPLEFT", 177, -54)
-
-local resultDD = CreateSearchableDropdown(historyFrame, "TkResultDD", 155, {
-    defaultLabel = "Result: All",
-    getOptions = function()
-        return {
-            { key = "WIN",  text = "|cff00ff00WIN|r",  searchText = "win",  isChecked = function() return filters.result == "WIN" end },
-            { key = "LOSS", text = "|cffff0000LOSS|r", searchText = "loss", isChecked = function() return filters.result == "LOSS" end },
-        }
-    end,
-    onToggle = function(key)
-        -- Single-select toggle: clicking the active one clears it, otherwise sets it
-        if filters.result == key then
-            filters.result = nil
-        else
-            filters.result = key
-        end
-        RefreshHistory()
-    end,
-    onClear = function() filters.result = nil; RefreshHistory() end,
-    getLabel = function()
-        if filters.result == "WIN" then return "|cff00ff00WIN|r" end
-        if filters.result == "LOSS" then return "|cffff0000LOSS|r" end
-        return "Result: All"
-    end,
-})
-resultDD.frame:SetPoint("TOPLEFT", 342, -54)
-
-local exportBtn = CreateFrame("Button", nil, historyFrame, "UIPanelButtonTemplate")
-exportBtn:SetSize(60, 22)
-exportBtn:SetPoint("TOPRIGHT", -80, -58)
-exportBtn:SetNormalFontObject("GameFontNormalSmall")
-exportBtn:SetHighlightFontObject("GameFontHighlightSmall")
-exportBtn:SetText("Export")
-exportBtn:SetScript("OnClick", function() ShowExportDialog() end)
-
-local resetBtn = CreateFrame("Button", nil, historyFrame, "UIPanelButtonTemplate")
-resetBtn:SetSize(60, 22)
-resetBtn:SetPoint("TOPRIGHT", -16, -58)
-resetBtn:SetNormalFontObject("GameFontNormalSmall")
-resetBtn:SetHighlightFontObject("GameFontHighlightSmall")
-resetBtn:SetText("Reset")
-resetBtn:SetScript("OnClick", function()
-    filters.friendlyComps = {}
-    filters.partners = {}
-    filters.enemyComps = {}
-    filters.enemyPlayers = {}
-    filters.enemyRaces = {}
-    filters.result = nil
-    friendlyCompDD:SetLabel("Player Comp: All")
-    partnerDD:SetLabel("Partner: All")
-    enemyCompDD:SetLabel("Enemy Comp: All")
-    enemyPlayerDD:SetLabel("Enemy Players: All")
-    enemyRaceDD:SetLabel("Race: All")
-    resultDD:SetLabel("Result: All")
-    RefreshHistory()
-end)
-
--- Column headers
-local headerY = -84
-local headers = {
-    { text = "#",        x = 4,   w = 24, justify = "RIGHT" },
-    { text = "Result",   x = 32,  w = 36, justify = "LEFT" },
-    { text = "Friendly", x = 68,  w = 210, justify = "LEFT" },
-    { text = "",         x = 282, w = 20, justify = "CENTER" },  -- vs column (no header)
-    { text = "Enemy",    x = 305, w = 210, justify = "LEFT" },
-    { text = "Rating",   x = 520, w = 95, justify = "CENTER" },
-    { text = "Dur",      x = 620, w = 45, justify = "LEFT" },
-    { text = "Time",     x = 670, w = 60, justify = "RIGHT" },
-}
-for _, h in ipairs(headers) do
-    if h.text ~= "" then
-        local fs = historyFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        fs:SetPoint("TOPLEFT", h.x, headerY)
-        fs:SetWidth(h.w)
-        fs:SetJustifyH(h.justify)
-        fs:SetWordWrap(false)
-        fs:SetText("|cff888888" .. h.text .. "|r")
-    end
+local function CreateBrandButton(parent, width, height, label, onClick)
+    local btn = CreateFrame("Button", nil, parent, "BackdropTemplate")
+    btn:SetSize(width, height)
+    btn:SetBackdrop({ edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border", edgeSize = 10, insets = { left = 2, right = 2, top = 2, bottom = 2 } })
+    btn:SetBackdropBorderColor(C.divider[1], C.divider[2], C.divider[3], C.divider[4])
+    local bg = btn:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints()
+    bg:SetColorTexture(unpack(C.sidebarBg))
+    btn._bg = bg
+    local txt = btn:CreateFontString(nil, "OVERLAY")
+    txt:SetFont(lib.FONT_BODY, 10, "")
+    txt:SetPoint("CENTER")
+    txt:SetText(label)
+    txt:SetTextColor(C.textNormal[1], C.textNormal[2], C.textNormal[3])
+    btn._txt = txt
+    btn:SetScript("OnEnter", function()
+        bg:SetColorTexture(unpack(C.tabActive))
+        txt:SetTextColor(C.accent[1], C.accent[2], C.accent[3])
+    end)
+    btn:SetScript("OnLeave", function()
+        bg:SetColorTexture(unpack(C.sidebarBg))
+        txt:SetTextColor(C.textNormal[1], C.textNormal[2], C.textNormal[3])
+    end)
+    btn:SetScript("OnClick", onClick)
+    return btn
 end
 
--- Thin separator line below headers
-local headerSep = historyFrame:CreateTexture(nil, "ARTWORK")
-headerSep:SetHeight(1)
-headerSep:SetPoint("TOPLEFT", 4, headerY - 12)
-headerSep:SetPoint("TOPRIGHT", -16, headerY - 12)
-headerSep:SetColorTexture(0.4, 0.4, 0.4, 0.5)
+-- (Export/Reset buttons, column headers, scroll frame, stats panel created inside BuildHistoryUI)
 
--- Scroll frame
-local scrollFrame = CreateFrame("ScrollFrame", nil, historyFrame, "UIPanelScrollFrameTemplate")
-scrollFrame:SetPoint("TOPLEFT", 10, headerY - 14)
-scrollFrame:SetPoint("BOTTOMRIGHT", -30, 100)
-
-local content = CreateFrame("Frame", nil, scrollFrame)
-content:SetSize(740, 1) -- height grows dynamically
-scrollFrame:SetScrollChild(content)
-
----------------------------------------------------------------------------
--- Stats Panel (bottom of history window)
----------------------------------------------------------------------------
-local statsSep = historyFrame:CreateTexture(nil, "ARTWORK")
-statsSep:SetHeight(1)
-statsSep:SetPoint("BOTTOMLEFT", 8, 90)
-statsSep:SetPoint("BOTTOMRIGHT", -16, 90)
-statsSep:SetColorTexture(0.4, 0.4, 0.4, 0.5)
-
-local bestHeader = historyFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-bestHeader:SetPoint("BOTTOMLEFT", 14, 72)
-bestHeader:SetText("|cff00ff00Best Matchups|r")
-
-local worstHeader = historyFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-worstHeader:SetPoint("BOTTOMLEFT", 380, 72)
-worstHeader:SetText("|cffff4444Worst Matchups|r")
-
-local NUM_STAT_ROWS = 5
+local NUM_STAT_ROWS = 10
 local STAT_COL_COMP = 0      -- comp name offset from row left
-local STAT_COL_RECORD = 175  -- W/L record offset
-local STAT_COL_PCT = 235     -- percentage offset
-local STAT_COL_BAR = 270     -- win% bar offset
-local STAT_BAR_WIDTH = 70    -- max bar width
-local STAT_ROW_WIDTH = 350
+local STAT_COL_RECORD = 165  -- W/L record offset
+local STAT_COL_PCT = 220     -- percentage offset
+local STAT_COL_BAR = 255     -- win% bar offset
+local STAT_BAR_WIDTH = 55    -- max bar width
+local STAT_ROW_WIDTH = 310
 
 local function CreateStatRow(parent, x, y)
     local row = {}
 
-    row.comp = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    row.comp:SetPoint("BOTTOMLEFT", x + STAT_COL_COMP, y)
-    row.comp:SetWidth(170)
+    row.comp = parent:CreateFontString(nil, "OVERLAY")
+    row.comp:SetFont(lib.FONT_BODY, 10, "")
+    row.comp:SetPoint("TOPLEFT", x + STAT_COL_COMP, y)
+    row.comp:SetWidth(160)
     row.comp:SetJustifyH("LEFT")
     row.comp:SetWordWrap(false)
 
-    row.record = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    row.record:SetPoint("BOTTOMLEFT", x + STAT_COL_RECORD, y)
+    row.record = parent:CreateFontString(nil, "OVERLAY")
+    row.record:SetFont(lib.FONT_BODY, 10, "")
+    row.record:SetPoint("TOPLEFT", x + STAT_COL_RECORD, y)
     row.record:SetWidth(55)
     row.record:SetJustifyH("LEFT")
     row.record:SetWordWrap(false)
 
-    row.pct = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    row.pct:SetPoint("BOTTOMLEFT", x + STAT_COL_PCT, y)
+    row.pct = parent:CreateFontString(nil, "OVERLAY")
+    row.pct:SetFont(lib.FONT_BODY, 10, "")
+    row.pct:SetPoint("TOPLEFT", x + STAT_COL_PCT, y)
     row.pct:SetWidth(35)
     row.pct:SetJustifyH("RIGHT")
     row.pct:SetWordWrap(false)
 
     -- Win% bar background (dark)
     row.barBg = parent:CreateTexture(nil, "ARTWORK")
-    row.barBg:SetPoint("BOTTOMLEFT", parent, "BOTTOMLEFT", x + STAT_COL_BAR, y + 1)
+    row.barBg:SetPoint("TOPLEFT", parent, "TOPLEFT", x + STAT_COL_BAR, y + 1)
     row.barBg:SetSize(STAT_BAR_WIDTH, 8)
-    row.barBg:SetColorTexture(0.15, 0.15, 0.15, 1)
+    row.barBg:SetColorTexture(unpack(C.sidebarBg))
 
     -- Win% bar fill
     row.barFill = parent:CreateTexture(nil, "OVERLAY")
-    row.barFill:SetPoint("BOTTOMLEFT", parent, "BOTTOMLEFT", x + STAT_COL_BAR, y + 1)
+    row.barFill:SetPoint("TOPLEFT", parent, "TOPLEFT", x + STAT_COL_BAR, y + 1)
     row.barFill:SetSize(1, 8)
     row.barFill:SetColorTexture(0, 1, 0, 0.8)
 
@@ -1439,18 +1290,13 @@ local function CreateStatRow(parent, x, y)
     return row
 end
 
-local bestRows = {}
-local worstRows = {}
-for i = 1, NUM_STAT_ROWS do
-    local y = 72 - i * 12
-    bestRows[i] = CreateStatRow(historyFrame, 14, y)
-    worstRows[i] = CreateStatRow(historyFrame, 380, y)
-end
+function RefreshStats()
+    if not ui.built then return end
 
-local function RefreshStats(filteredList)
     -- Tally wins/losses per enemy comp from the filtered list
     local compStats = {} -- compKey → { wins, losses }
-    for _, entry in ipairs(filteredList) do
+    local totalWins, totalLosses, totalNet, totalHasRating = 0, 0, 0, false
+    for _, entry in ipairs(lastFilteredList) do
         local comp = GetCompKey(entry.game.enemyTeam)
         if not comp and entry.game.enemyComp and #entry.game.enemyComp > 0 then
             local sorted = {}
@@ -1466,14 +1312,30 @@ local function RefreshStats(filteredList)
                 compStats[comp].losses = compStats[comp].losses + 1
             end
         end
+        if entry.game.result == "WIN" then totalWins = totalWins + 1 else totalLosses = totalLosses + 1 end
+        if entry.game.ratingChange then
+            totalNet = totalNet + entry.game.ratingChange
+            totalHasRating = true
+        end
     end
+
+    -- Summary line
+    local total = totalWins + totalLosses
+    local wrPct = (total > 0) and math.floor(totalWins / total * 100 + 0.5) or 0
+    local summaryParts = { total .. " games", "|cff00ff00" .. totalWins .. "W|r / |cffff0000" .. totalLosses .. "L|r", wrPct .. "% WR" }
+    if totalHasRating then
+        local sign = totalNet >= 0 and "+" or ""
+        local color = totalNet >= 0 and "|cff00ff00" or "|cffff0000"
+        table.insert(summaryParts, "Net: " .. color .. sign .. totalNet .. "|r")
+    end
+    ui.statsSummaryText:SetText(table.concat(summaryParts, "  |cff555555·|r  "))
 
     -- Build sorted list
     local compList = {}
     for comp, stats in pairs(compStats) do
-        local total = stats.wins + stats.losses
-        local winPct = (total > 0) and (stats.wins / total * 100) or 0
-        table.insert(compList, { comp = comp, wins = stats.wins, losses = stats.losses, total = total, pct = winPct })
+        local ct = stats.wins + stats.losses
+        local winPct = (ct > 0) and (stats.wins / ct * 100) or 0
+        table.insert(compList, { comp = comp, wins = stats.wins, losses = stats.losses, total = ct, pct = winPct })
     end
 
     -- Sort all comps by win% desc
@@ -1497,8 +1359,8 @@ local function RefreshStats(filteredList)
     end
 
     for i = 1, NUM_STAT_ROWS do
-        bestRows[i]:SetData(best[i])
-        worstRows[i]:SetData(worst[i])
+        ui.bestRows[i]:SetData(best[i])
+        ui.worstRows[i]:SetData(worst[i])
     end
 end
 
@@ -1507,6 +1369,91 @@ local function FormatDuration(seconds)
     local m = math.floor(seconds / 60)
     local s = seconds % 60
     return string.format("%d:%02d", m, s)
+end
+
+-- Build a sorted string key of non-player teammate names for session boundary detection
+local function GetPartnerKey(game)
+    local playerName = UnitName("player")
+    local names = {}
+    for _, p in ipairs(game.friendlyTeam or {}) do
+        if p.name ~= playerName then
+            table.insert(names, p.name)
+        end
+    end
+    table.sort(names)
+    return table.concat(names, "/")
+end
+
+-- Compute sessions from a chronological games array.
+-- New session starts on: time gap > gapThreshold, partner change, or bracket change.
+-- Returns array of { startTime, endTime, bracket, games={{idx,game},...}, wins, losses, netRating, hasRating, partners }
+local function ComputeSessions(games, gapThreshold)
+    if not games or #games == 0 then return {} end
+    gapThreshold = gapThreshold or 1200
+
+    local sessions = {}
+    local cur = nil
+
+    for i = 1, #games do
+        local game = games[i]
+        local partnerKey = GetPartnerKey(game)
+        local bracket = game.bracket or "?"
+
+        local needNew = false
+        if not cur then
+            needNew = true
+        else
+            -- Check time gap
+            local prevEnd = cur.endTime or cur.startTime
+            local thisStart = game.startTime or 0
+            if prevEnd and thisStart and (thisStart - prevEnd) > gapThreshold then
+                needNew = true
+            end
+            -- Check partner change
+            if not needNew and partnerKey ~= cur.partnerKey then
+                needNew = true
+            end
+            -- Check bracket change
+            if not needNew and tostring(bracket) ~= tostring(cur.bracket) then
+                needNew = true
+            end
+        end
+
+        if needNew then
+            cur = {
+                startTime = game.startTime,
+                endTime = game.endTime,
+                bracket = bracket,
+                partnerKey = partnerKey,
+                partners = partnerKey,
+                games = {},
+                wins = 0,
+                losses = 0,
+                netRating = 0,
+                hasRating = false,
+            }
+            table.insert(sessions, cur)
+        end
+
+        table.insert(cur.games, { idx = i, game = game })
+        if game.endTime and (not cur.endTime or game.endTime > cur.endTime) then
+            cur.endTime = game.endTime
+        end
+        if game.startTime and (not cur.startTime or game.startTime < cur.startTime) then
+            cur.startTime = game.startTime
+        end
+        if game.result == "WIN" then
+            cur.wins = cur.wins + 1
+        else
+            cur.losses = cur.losses + 1
+        end
+        if game.ratingChange then
+            cur.netRating = cur.netRating + game.ratingChange
+            cur.hasRating = true
+        end
+    end
+
+    return sessions
 end
 
 local function ColorClass(name)
@@ -1567,182 +1514,720 @@ end
 
 local rowPool = {}
 
+local function CreateMatchRow(pool, idx)
+    local row = pool[idx]
+    if row then return row end
+
+    row = CreateFrame("Frame", nil, ui.content)
+    row:SetSize(610, ROW_HEIGHT)
+    pool[idx] = row
+
+    row.result = row:CreateFontString(nil, "OVERLAY")
+    row.result:SetFont(lib.FONT_BODY, 10, "")
+    row.result:SetPoint("LEFT", 4, 0)
+    row.result:SetWidth(36)
+
+    row.friendly = row:CreateFontString(nil, "OVERLAY")
+    row.friendly:SetFont(lib.FONT_BODY, 10, "")
+    row.friendly:SetPoint("LEFT", 44, 0)
+    row.friendly:SetWidth(200)
+    row.friendly:SetJustifyH("LEFT")
+    row.friendly:SetMaxLines(2)
+    row.friendly:SetNonSpaceWrap(false)
+    row.friendly:SetWordWrap(true)
+
+    row.vs = row:CreateFontString(nil, "OVERLAY")
+    row.vs:SetFont(lib.FONT_BODY, 10, "")
+    row.vs:SetPoint("LEFT", 248, 0)
+    row.vs:SetWidth(16)
+    row.vs:SetJustifyH("CENTER")
+    row.vs:SetTextColor(C.textMuted[1], C.textMuted[2], C.textMuted[3], C.textMuted[4] or 1)
+
+    row.enemy = row:CreateFontString(nil, "OVERLAY")
+    row.enemy:SetFont(lib.FONT_BODY, 10, "")
+    row.enemy:SetPoint("LEFT", 268, 0)
+    row.enemy:SetWidth(200)
+    row.enemy:SetJustifyH("LEFT")
+    row.enemy:SetMaxLines(2)
+    row.enemy:SetNonSpaceWrap(false)
+    row.enemy:SetWordWrap(true)
+
+    row.rating = row:CreateFontString(nil, "OVERLAY")
+    row.rating:SetFont(lib.FONT_BODY, 10, "")
+    row.rating:SetPoint("LEFT", 472, 0)
+    row.rating:SetWidth(90)
+    row.rating:SetJustifyH("CENTER")
+
+    row.duration = row:CreateFontString(nil, "OVERLAY")
+    row.duration:SetFont(lib.FONT_BODY, 10, "")
+    row.duration:SetPoint("LEFT", 566, 0)
+    row.duration:SetWidth(45)
+    row.duration:SetJustifyH("CENTER")
+
+    row.bg = row:CreateTexture(nil, "BACKGROUND")
+    row.bg:SetAllPoints()
+
+    return row
+end
+
+local function PopulateMatchRow(row, entry, displayIdx)
+    local game = entry.game
+
+    -- Alternating row color
+    if displayIdx % 2 == 0 then
+        row.bg:SetColorTexture(C.rowHover[1], C.rowHover[2], C.rowHover[3], C.rowHover[4])
+    else
+        row.bg:SetColorTexture(0, 0, 0, 0)
+    end
+
+    if game.result == "WIN" then
+        row.result:SetText("|cff00ff00WIN|r")
+    else
+        row.result:SetText("|cffff0000LOSS|r")
+    end
+
+    local friendlyStr = FormatTeamNames(game.friendlyTeam)
+    row.friendly:SetText(friendlyStr or "—")
+
+    row.vs:SetText("vs")
+
+    local enemyStr = FormatTeamNames(game.enemyTeam)
+    if not enemyStr then
+        local parts = {}
+        for _, class in ipairs(game.enemyComp or {}) do
+            table.insert(parts, ColorClass(class))
+        end
+        enemyStr = #parts > 0 and table.concat(parts, " ") or "?"
+    end
+    row.enemy:SetText(enemyStr)
+
+    if game.ratingChange then
+        local sign = game.ratingChange >= 0 and "+" or ""
+        local color = game.ratingChange >= 0 and "|cff00ff00" or "|cffff0000"
+        local ratingText = color .. sign .. game.ratingChange .. "|r"
+        if game.enemyMMR and game.enemyMMR > 0 then
+            ratingText = ratingText .. " |cff888888vs " .. game.enemyMMR .. "|r"
+        end
+        row.rating:SetText(ratingText)
+    elseif game.enemyMMR and game.enemyMMR > 0 then
+        row.rating:SetText("|cff888888vs " .. game.enemyMMR .. "|r")
+    else
+        row.rating:SetText("|cff555555—|r")
+    end
+
+    local dur = (game.startTime and game.endTime) and (game.endTime - game.startTime) or nil
+    row.duration:SetText(FormatDuration(dur))
+    row.duration:SetTextColor(C.textNormal[1], C.textNormal[2], C.textNormal[3])
+end
+
+local function CreateSessionHeaderRow(pool, idx)
+    local hdr = pool[idx]
+    if hdr then return hdr end
+
+    hdr = CreateFrame("Button", nil, ui.content)
+    hdr:SetSize(610, SESSION_HEADER_HEIGHT)
+    pool[idx] = hdr
+
+    -- Dark background
+    hdr.bg = hdr:CreateTexture(nil, "BACKGROUND")
+    hdr.bg:SetAllPoints()
+    hdr.bg:SetColorTexture(C.bgRaised[1], C.bgRaised[2], C.bgRaised[3], C.bgRaised[4] or 1)
+
+    -- 1px top border
+    hdr.topBorder = hdr:CreateTexture(nil, "ARTWORK")
+    hdr.topBorder:SetHeight(1)
+    hdr.topBorder:SetPoint("TOPLEFT", 0, 0)
+    hdr.topBorder:SetPoint("TOPRIGHT", 0, 0)
+    hdr.topBorder:SetColorTexture(C.divider[1], C.divider[2], C.divider[3], C.divider[4])
+
+    -- Collapse arrow
+    hdr.arrow = hdr:CreateFontString(nil, "OVERLAY")
+    hdr.arrow:SetFont(lib.FONT_BODY, 11, "")
+    hdr.arrow:SetPoint("LEFT", 4, 0)
+    hdr.arrow:SetText("v")
+
+    -- Date/time
+    hdr.dateText = hdr:CreateFontString(nil, "OVERLAY")
+    hdr.dateText:SetFont(lib.FONT_BODY, 10, "")
+    hdr.dateText:SetPoint("LEFT", 20, 0)
+    hdr.dateText:SetWidth(130)
+    hdr.dateText:SetJustifyH("LEFT")
+    hdr.dateText:SetTextColor(C.accent[1], C.accent[2], C.accent[3])
+
+    -- Game count
+    hdr.countText = hdr:CreateFontString(nil, "OVERLAY")
+    hdr.countText:SetFont(lib.FONT_BODY, 10, "")
+    hdr.countText:SetPoint("LEFT", 155, 0)
+    hdr.countText:SetWidth(65)
+    hdr.countText:SetJustifyH("LEFT")
+    hdr.countText:SetTextColor(C.textNormal[1], C.textNormal[2], C.textNormal[3])
+
+    -- W/L record
+    hdr.recordText = hdr:CreateFontString(nil, "OVERLAY")
+    hdr.recordText:SetFont(lib.FONT_BODY, 10, "")
+    hdr.recordText:SetPoint("LEFT", 225, 0)
+    hdr.recordText:SetWidth(85)
+    hdr.recordText:SetJustifyH("LEFT")
+
+    -- Net rating
+    hdr.ratingText = hdr:CreateFontString(nil, "OVERLAY")
+    hdr.ratingText:SetFont(lib.FONT_MONO, 10, "")
+    hdr.ratingText:SetPoint("LEFT", 315, 0)
+    hdr.ratingText:SetWidth(70)
+    hdr.ratingText:SetJustifyH("LEFT")
+
+    -- Duration
+    hdr.durationText = hdr:CreateFontString(nil, "OVERLAY")
+    hdr.durationText:SetFont(lib.FONT_MONO, 10, "")
+    hdr.durationText:SetPoint("LEFT", 400, 0)
+    hdr.durationText:SetWidth(55)
+    hdr.durationText:SetJustifyH("LEFT")
+    hdr.durationText:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
+
+    -- Bracket
+    hdr.bracketText = hdr:CreateFontString(nil, "OVERLAY")
+    hdr.bracketText:SetFont(lib.FONT_BODY, 10, "")
+    hdr.bracketText:SetPoint("LEFT", 470, 0)
+    hdr.bracketText:SetWidth(50)
+    hdr.bracketText:SetJustifyH("LEFT")
+    hdr.bracketText:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
+
+    -- Click handler for collapse/expand
+    hdr:SetScript("OnClick", function(self)
+        sessionCollapsed[self.sessionStartTime] = not sessionCollapsed[self.sessionStartTime]
+        RefreshHistory()
+    end)
+
+    -- Hover highlight
+    hdr:SetScript("OnEnter", function(self)
+        self.bg:SetColorTexture(C.bgElevated[1], C.bgElevated[2], C.bgElevated[3], C.bgElevated[4] or 1)
+    end)
+    hdr:SetScript("OnLeave", function(self)
+        self.bg:SetColorTexture(C.bgRaised[1], C.bgRaised[2], C.bgRaised[3], C.bgRaised[4] or 1)
+    end)
+
+    return hdr
+end
+
+---------------------------------------------------------------------------
+-- BuildHistoryUI — creates all history UI inside the options panel content frame
+---------------------------------------------------------------------------
+local function BuildHistoryUI(contentFrame)
+    if ui.built then return end
+
+    -- Summary text (replaces the old frame title)
+    ui.summaryText = contentFrame:CreateFontString(nil, "OVERLAY")
+    ui.summaryText:SetFont(lib.FONT_DISPLAY, 11, "")
+    ui.summaryText:SetPoint("TOPLEFT", 8, -6)
+    ui.summaryText:SetTextColor(C.textBright[1], C.textBright[2], C.textBright[3])
+    ui.summaryText:SetText("Trinketed — Arena History")
+
+    -- Sub-tabs: Sessions | History | Stats
+    ui.sessionsTabBtn = CreateTabButton(contentFrame, "Sessions", 8)
+    ui.historyTabBtn = CreateTabButton(contentFrame, "History", 92)
+    ui.statsTabBtn = CreateTabButton(contentFrame, "Stats", 176)
+    -- Reposition to Y=-22 (plan spec)
+    ui.sessionsTabBtn:ClearAllPoints()
+    ui.sessionsTabBtn:SetPoint("TOPLEFT", contentFrame, "TOPLEFT", 8, -22)
+    ui.historyTabBtn:ClearAllPoints()
+    ui.historyTabBtn:SetPoint("TOPLEFT", contentFrame, "TOPLEFT", 92, -22)
+    ui.statsTabBtn:ClearAllPoints()
+    ui.statsTabBtn:SetPoint("TOPLEFT", contentFrame, "TOPLEFT", 176, -22)
+
+    ui.sessionsTabBtn:SetScript("OnClick", function() SetActiveTab("sessions") end)
+    ui.historyTabBtn:SetScript("OnClick", function() SetActiveTab("history") end)
+    ui.statsTabBtn:SetScript("OnClick", function() SetActiveTab("stats") end)
+
+    -- Filter Row 1 (Y = -46), width = 130 each
+    ui.friendlyCompDD = CreateSearchableDropdown(contentFrame, "TkCompDD", 130, {
+        defaultLabel = "Player Comp: All",
+        getOptions = function()
+            local out = {}
+            for _, comp in ipairs(CollectUniqueComps("friendlyTeam")) do
+                table.insert(out, { key = comp, text = FormatCompLabel(comp), searchText = comp:lower():gsub("/", " "), isChecked = function() return filters.friendlyComps[comp] == true end })
+            end
+            return out
+        end,
+        onToggle = function(key)
+            if filters.friendlyComps[key] then filters.friendlyComps[key] = nil else filters.friendlyComps[key] = true end
+            filters.partners = {}
+            RefreshHistory()
+        end,
+        onClear = function() filters.friendlyComps = {}; filters.partners = {}; RefreshHistory() end,
+        getLabel = function()
+            if not next(filters.friendlyComps) then return "Player Comp: All" end
+            local t = {}; for c in pairs(filters.friendlyComps) do table.insert(t, FormatCompLabel(c)) end
+            return "Player Comp: " .. table.concat(t, ", ")
+        end,
+    })
+    ui.friendlyCompDD.frame:SetPoint("TOPLEFT", contentFrame, "TOPLEFT", 8, -46)
+
+    ui.partnerDD = CreateSearchableDropdown(contentFrame, "TkPartDD", 130, {
+        defaultLabel = "Partner: All",
+        getOptions = function()
+            local out = {}
+            for _, p in ipairs(CollectUniquePartners()) do
+                local color = CLASS_COLORS[p.class] or "ffffffff"
+                table.insert(out, { key = p.name, text = "|c" .. color .. p.name .. "|r", searchText = p.name:lower(), isChecked = function() return filters.partners[p.name] == true end })
+            end
+            return out
+        end,
+        onToggle = function(key)
+            if filters.partners[key] then filters.partners[key] = nil else filters.partners[key] = true end
+            RefreshHistory()
+        end,
+        onClear = function() filters.partners = {}; RefreshHistory() end,
+        getLabel = function()
+            if not next(filters.partners) then return "Partner: All" end
+            local t = {}; for n in pairs(filters.partners) do table.insert(t, n) end
+            return "Partner: " .. table.concat(t, ", ")
+        end,
+    })
+    ui.partnerDD.frame:SetPoint("TOPLEFT", contentFrame, "TOPLEFT", 146, -46)
+
+    ui.enemyCompDD = CreateSearchableDropdown(contentFrame, "TkECompDD", 130, {
+        defaultLabel = "Enemy Comp: All",
+        getOptions = function()
+            local out = {}
+            for _, comp in ipairs(CollectUniqueComps("enemyTeam")) do
+                table.insert(out, { key = comp, text = FormatCompLabel(comp), searchText = comp:lower():gsub("/", " "), isChecked = function() return filters.enemyComps[comp] == true end })
+            end
+            return out
+        end,
+        onToggle = function(key)
+            if filters.enemyComps[key] then filters.enemyComps[key] = nil else filters.enemyComps[key] = true end
+            filters.enemyPlayers = {}; filters.enemyRaces = {}
+            RefreshHistory()
+        end,
+        onClear = function() filters.enemyComps = {}; filters.enemyPlayers = {}; filters.enemyRaces = {}; RefreshHistory() end,
+        getLabel = function()
+            if not next(filters.enemyComps) then return "Enemy Comp: All" end
+            local t = {}; for c in pairs(filters.enemyComps) do table.insert(t, FormatCompLabel(c)) end
+            return "Enemy Comp: " .. table.concat(t, ", ")
+        end,
+    })
+    ui.enemyCompDD.frame:SetPoint("TOPLEFT", contentFrame, "TOPLEFT", 284, -46)
+
+    -- Filter Row 2 (Y = -72), width = 130 each
+    ui.enemyPlayerDD = CreateSearchableDropdown(contentFrame, "TkEPlrDD", 130, {
+        defaultLabel = "Enemy Players: All",
+        getOptions = function()
+            local out = {}
+            for _, p in ipairs(CollectUniqueEnemyPlayers()) do
+                local color = CLASS_COLORS[p.class] or "ffffffff"
+                table.insert(out, { key = p.name, text = "|c" .. color .. p.name .. "|r", searchText = p.name:lower(), isChecked = function() return filters.enemyPlayers[p.name] == true end })
+            end
+            return out
+        end,
+        onToggle = function(key)
+            if filters.enemyPlayers[key] then filters.enemyPlayers[key] = nil else filters.enemyPlayers[key] = true end
+            RefreshHistory()
+        end,
+        onClear = function() filters.enemyPlayers = {}; RefreshHistory() end,
+        getLabel = function()
+            if not next(filters.enemyPlayers) then return "Enemy Players: All" end
+            local t = {}; for n in pairs(filters.enemyPlayers) do table.insert(t, n) end
+            return "Enemy Players: " .. table.concat(t, ", ")
+        end,
+    })
+    ui.enemyPlayerDD.frame:SetPoint("TOPLEFT", contentFrame, "TOPLEFT", 8, -72)
+
+    ui.enemyRaceDD = CreateSearchableDropdown(contentFrame, "TkERaceDD", 130, {
+        defaultLabel = "Race: All",
+        getOptions = function()
+            local out = {}
+            for _, race in ipairs(CollectUniqueEnemyRaces()) do
+                table.insert(out, { key = race, text = race, searchText = race:lower(), isChecked = function() return filters.enemyRaces[race] == true end })
+            end
+            return out
+        end,
+        onToggle = function(key)
+            if filters.enemyRaces[key] then filters.enemyRaces[key] = nil else filters.enemyRaces[key] = true end
+            RefreshHistory()
+        end,
+        onClear = function() filters.enemyRaces = {}; RefreshHistory() end,
+        getLabel = function()
+            if not next(filters.enemyRaces) then return "Race: All" end
+            local t = {}; for r in pairs(filters.enemyRaces) do table.insert(t, r) end
+            return "Race: " .. table.concat(t, ", ")
+        end,
+    })
+    ui.enemyRaceDD.frame:SetPoint("TOPLEFT", contentFrame, "TOPLEFT", 146, -72)
+
+    ui.resultDD = CreateSearchableDropdown(contentFrame, "TkResultDD", 130, {
+        defaultLabel = "Result: All",
+        getOptions = function()
+            return {
+                { key = "WIN",  text = "|cff00ff00WIN|r",  searchText = "win",  isChecked = function() return filters.result == "WIN" end },
+                { key = "LOSS", text = "|cffff0000LOSS|r", searchText = "loss", isChecked = function() return filters.result == "LOSS" end },
+            }
+        end,
+        onToggle = function(key)
+            if filters.result == key then
+                filters.result = nil
+            else
+                filters.result = key
+            end
+            RefreshHistory()
+        end,
+        onClear = function() filters.result = nil; RefreshHistory() end,
+        getLabel = function()
+            if filters.result == "WIN" then return "|cff00ff00WIN|r" end
+            if filters.result == "LOSS" then return "|cffff0000LOSS|r" end
+            return "Result: All"
+        end,
+    })
+    ui.resultDD.frame:SetPoint("TOPLEFT", contentFrame, "TOPLEFT", 284, -72)
+
+    -- Export / Reset buttons (TOPRIGHT of contentFrame)
+    local exportBtn = CreateBrandButton(contentFrame, 58, 22, "Export", function() ShowExportDialog() end)
+    exportBtn:SetPoint("TOPRIGHT", contentFrame, "TOPRIGHT", -68, -72)
+
+    local resetBtn = CreateBrandButton(contentFrame, 58, 22, "Reset", nil)
+    resetBtn:SetPoint("TOPRIGHT", contentFrame, "TOPRIGHT", -6, -72)
+    resetBtn:SetScript("OnClick", function()
+        filters.friendlyComps = {}
+        filters.partners = {}
+        filters.enemyComps = {}
+        filters.enemyPlayers = {}
+        filters.enemyRaces = {}
+        filters.result = nil
+        ui.friendlyCompDD:SetLabel("Player Comp: All")
+        ui.partnerDD:SetLabel("Partner: All")
+        ui.enemyCompDD:SetLabel("Enemy Comp: All")
+        ui.enemyPlayerDD:SetLabel("Enemy Players: All")
+        ui.enemyRaceDD:SetLabel("Race: All")
+        ui.resultDD:SetLabel("Result: All")
+        RefreshHistory()
+    end)
+
+    -- Column headers (Y = -98)
+    local headerY = -98
+    local headers = {
+        { text = "Result",   x = 4,   w = 36,  justify = "LEFT" },
+        { text = "Friendly", x = 44,  w = 200, justify = "LEFT" },
+        { text = "",         x = 248, w = 16,  justify = "CENTER" },
+        { text = "Enemy",    x = 268, w = 200, justify = "LEFT" },
+        { text = "Rating",   x = 472, w = 90,  justify = "CENTER" },
+        { text = "Dur",      x = 566, w = 45,  justify = "CENTER" },
+    }
+    ui.headerFontStrings = {}
+    for _, h in ipairs(headers) do
+        if h.text ~= "" then
+            local fs = contentFrame:CreateFontString(nil, "OVERLAY")
+            fs:SetFont(lib.FONT_BODY, 10, "")
+            fs:SetPoint("TOPLEFT", h.x, headerY)
+            fs:SetWidth(h.w)
+            fs:SetJustifyH(h.justify)
+            fs:SetWordWrap(false)
+            fs:SetTextColor(C.textMuted[1], C.textMuted[2], C.textMuted[3], C.textMuted[4] or 1)
+            fs:SetText(h.text)
+            table.insert(ui.headerFontStrings, fs)
+        end
+    end
+
+    -- Thin separator line below headers (Y = -110)
+    ui.headerSep = contentFrame:CreateTexture(nil, "ARTWORK")
+    ui.headerSep:SetHeight(1)
+    ui.headerSep:SetPoint("TOPLEFT", 4, -110)
+    ui.headerSep:SetPoint("TOPRIGHT", -6, -110)
+    ui.headerSep:SetColorTexture(C.divider[1], C.divider[2], C.divider[3], C.divider[4])
+
+    -- Scroll frame (Y = -112 to bottom -4)
+    ui.scrollFrame = CreateFrame("ScrollFrame", nil, contentFrame, "UIPanelScrollFrameTemplate")
+    ui.scrollFrame:SetPoint("TOPLEFT", 4, -112)
+    ui.scrollFrame:SetPoint("BOTTOMRIGHT", -22, 4)
+
+    ui.content = CreateFrame("Frame", nil, ui.scrollFrame)
+    ui.content:SetSize(610, 1) -- height grows dynamically
+    ui.scrollFrame:SetScrollChild(ui.content)
+
+    -- Stats container frame (hidden until stats tab is active)
+    ui.statsFrame = CreateFrame("Frame", nil, contentFrame)
+    ui.statsFrame:SetPoint("TOPLEFT", 0, -98)
+    ui.statsFrame:SetPoint("BOTTOMRIGHT", 0, 0)
+    ui.statsFrame:Hide()
+
+    -- Stats: Summary line
+    ui.statsSummaryText = ui.statsFrame:CreateFontString(nil, "OVERLAY")
+    ui.statsSummaryText:SetFont(lib.FONT_DISPLAY, 11, "")
+    ui.statsSummaryText:SetPoint("TOPLEFT", 14, -6)
+    ui.statsSummaryText:SetTextColor(C.textBright[1], C.textBright[2], C.textBright[3])
+    ui.statsSummaryText:SetText("")
+
+    -- Stats: Best Matchups header (left column)
+    local bestHeader = ui.statsFrame:CreateFontString(nil, "OVERLAY")
+    bestHeader:SetFont(lib.FONT_DISPLAY, 10, "")
+    bestHeader:SetPoint("TOPLEFT", 14, -30)
+    bestHeader:SetText("|cff00ff00Best Matchups|r")
+
+    -- Stats: Worst Matchups header (right column)
+    local worstHeader = ui.statsFrame:CreateFontString(nil, "OVERLAY")
+    worstHeader:SetFont(lib.FONT_DISPLAY, 10, "")
+    worstHeader:SetPoint("TOPLEFT", 330, -30)
+    worstHeader:SetText("|cffff4444Worst Matchups|r")
+
+    -- Stats: Stat rows (10 per column)
+    ui.bestRows = {}
+    ui.worstRows = {}
+    for i = 1, NUM_STAT_ROWS do
+        local y = -44 - (i - 1) * 14
+        ui.bestRows[i] = CreateStatRow(ui.statsFrame, 14, y)
+        ui.worstRows[i] = CreateStatRow(ui.statsFrame, 330, y)
+    end
+
+    -- Mark as built before initializing tab (SetActiveTab calls RefreshHistory)
+    ui.built = true
+    SetActiveTab("sessions")
+end
+
+
 function RefreshHistory()
+    if not ui.built then return end
+
     -- Recycle existing rows
     for _, row in ipairs(rowPool) do
         row:Hide()
     end
+    for _, row in ipairs(sessionMatchRowPool) do
+        row:Hide()
+    end
+    for _, hdr in ipairs(sessionHeaderPool) do
+        hdr:Hide()
+    end
 
     local allGames = TrinketedHistoryDB and TrinketedHistoryDB.games or {}
 
-    -- Apply filters — build list of {originalIndex, game} pairs, newest first
-    local filtered = {}
-    for i = #allGames, 1, -1 do
-        if GameMatchesFilters(allGames[i]) then
-            table.insert(filtered, { idx = i, game = allGames[i] })
-        end
-    end
+    if activeTab == "stats" then
+        -- Hide scroll area and column headers, show stats frame
+        for _, fs in ipairs(ui.headerFontStrings or {}) do fs:Hide() end
+        if ui.headerSep then ui.headerSep:Hide() end
+        ui.scrollFrame:Hide()
+        ui.statsFrame:Show()
 
-    local totalHeight = 0
-
-    for displayIdx = 1, #filtered do
-        local i = filtered[displayIdx].idx
-        local game = filtered[displayIdx].game
-
-        local row = rowPool[displayIdx]
-        if not row then
-            row = CreateFrame("Frame", nil, content)
-            row:SetSize(740, ROW_HEIGHT)
-            rowPool[displayIdx] = row
-
-            row.index = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-            row.index:SetPoint("LEFT", 4, 0)
-            row.index:SetWidth(24)
-            row.index:SetJustifyH("RIGHT")
-
-            row.result = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-            row.result:SetPoint("LEFT", 32, 0)
-            row.result:SetWidth(32)
-
-            row.friendly = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-            row.friendly:SetPoint("LEFT", 68, 0)
-            row.friendly:SetWidth(210)
-            row.friendly:SetJustifyH("LEFT")
-            row.friendly:SetMaxLines(2)
-            row.friendly:SetNonSpaceWrap(false)
-            row.friendly:SetWordWrap(true)
-
-            row.vs = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-            row.vs:SetPoint("LEFT", 282, 0)
-            row.vs:SetWidth(20)
-            row.vs:SetJustifyH("CENTER")
-            row.vs:SetTextColor(0.4, 0.4, 0.4)
-
-            row.enemy = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-            row.enemy:SetPoint("LEFT", 305, 0)
-            row.enemy:SetWidth(210)
-            row.enemy:SetJustifyH("LEFT")
-            row.enemy:SetMaxLines(2)
-            row.enemy:SetNonSpaceWrap(false)
-            row.enemy:SetWordWrap(true)
-
-            row.rating = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-            row.rating:SetPoint("LEFT", 520, 0)
-            row.rating:SetWidth(95)
-            row.rating:SetJustifyH("CENTER")
-
-            row.duration = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-            row.duration:SetPoint("LEFT", 620, 0)
-            row.duration:SetWidth(45)
-            row.duration:SetJustifyH("CENTER")
-
-            row.timeStr = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-            row.timeStr:SetPoint("LEFT", 670, 0)
-            row.timeStr:SetWidth(60)
-            row.timeStr:SetJustifyH("RIGHT")
-
-            -- Alternating background
-            row.bg = row:CreateTexture(nil, "BACKGROUND")
-            row.bg:SetAllPoints()
-        end
-
-        row:SetPoint("TOPLEFT", 0, -((displayIdx - 1) * ROW_HEIGHT))
-
-        -- Alternating row color
-        if displayIdx % 2 == 0 then
-            row.bg:SetColorTexture(1, 1, 1, 0.05)
-        else
-            row.bg:SetColorTexture(0, 0, 0, 0)
-        end
-
-        row.index:SetText("#" .. i)
-        row.index:SetTextColor(0.5, 0.5, 0.5)
-
-        if game.result == "WIN" then
-            row.result:SetText("|cff00ff00WIN|r")
-        else
-            row.result:SetText("|cffff0000LOSS|r")
-        end
-
-        -- Friendly team — show class-colored names
-        local friendlyStr = FormatTeamNames(game.friendlyTeam)
-        row.friendly:SetText(friendlyStr or "—")
-
-        row.vs:SetText("vs")
-
-        -- Enemy team — prefer names, fall back to class-only from enemyComp
-        local enemyStr = FormatTeamNames(game.enemyTeam)
-        if not enemyStr then
-            local parts = {}
-            for _, class in ipairs(game.enemyComp or {}) do
-                table.insert(parts, ColorClass(class))
+        -- Build filtered list from all games (apply current filters)
+        lastFilteredList = {}
+        for i = #allGames, 1, -1 do
+            if GameMatchesFilters(allGames[i]) then
+                table.insert(lastFilteredList, { idx = i, game = allGames[i] })
             end
-            enemyStr = #parts > 0 and table.concat(parts, " ") or "?"
         end
-        row.enemy:SetText(enemyStr)
 
-        -- Rating: show change + enemy MMR (e.g., "+16 vs 1820")
-        if game.ratingChange then
-            local sign = game.ratingChange >= 0 and "+" or ""
-            local color = game.ratingChange >= 0 and "|cff00ff00" or "|cffff0000"
-            local ratingText = color .. sign .. game.ratingChange .. "|r"
-            if game.enemyMMR and game.enemyMMR > 0 then
-                ratingText = ratingText .. " |cff888888vs " .. game.enemyMMR .. "|r"
+        -- Update summary
+        local wins, losses, netRating, hasRating = 0, 0, 0, false
+        for _, entry in ipairs(lastFilteredList) do
+            if entry.game.result == "WIN" then wins = wins + 1 else losses = losses + 1 end
+            if entry.game.ratingChange then
+                netRating = netRating + entry.game.ratingChange
+                hasRating = true
             end
-            row.rating:SetText(ratingText)
-        elseif game.enemyMMR and game.enemyMMR > 0 then
-            row.rating:SetText("|cff888888vs " .. game.enemyMMR .. "|r")
-        else
-            row.rating:SetText("|cff555555—|r")
+        end
+        local totalGames = #allGames
+        local shownGames = #lastFilteredList
+        local countStr = (shownGames < totalGames)
+            and (shownGames .. "/" .. totalGames .. " games")
+            or (totalGames .. " games")
+        local ratingStr = ""
+        if hasRating then
+            local sign = netRating >= 0 and "+" or ""
+            local color = netRating >= 0 and "|cff00ff00" or "|cffff0000"
+            ratingStr = " | Net: " .. color .. sign .. netRating .. "|r"
+        end
+        ui.summaryText:SetText(countStr .. " (" ..
+            "|cff00ff00" .. wins .. "W|r / |cffff0000" .. losses .. "L|r)" .. ratingStr)
+
+        RefreshStats()
+
+    elseif activeTab == "sessions" then
+        -- Hide stats frame, show scroll area and column headers
+        ui.statsFrame:Hide()
+        ui.scrollFrame:Show()
+        for _, fs in ipairs(ui.headerFontStrings or {}) do
+            fs:Show()
+        end
+        if ui.headerSep then ui.headerSep:Show() end
+
+        local gapThreshold = TrinketedHistoryDB and TrinketedHistoryDB.sessionGapThreshold or 1200
+        local sessions = ComputeSessions(allGames, gapThreshold)
+
+        -- For each session, filter games and skip empty sessions
+        local visibleSessions = {}
+        local totalWins, totalLosses, totalNet, totalHasRating, totalGamesCount = 0, 0, 0, false, 0
+        for sIdx = #sessions, 1, -1 do  -- newest first
+            local sess = sessions[sIdx]
+            local filteredGames = {}
+            local sWins, sLosses, sNet, sHasRating = 0, 0, 0, false
+            for _, entry in ipairs(sess.games) do
+                if GameMatchesFilters(entry.game) then
+                    table.insert(filteredGames, entry)
+                    if entry.game.result == "WIN" then sWins = sWins + 1 else sLosses = sLosses + 1 end
+                    if entry.game.ratingChange then
+                        sNet = sNet + entry.game.ratingChange
+                        sHasRating = true
+                    end
+                end
+            end
+            if #filteredGames > 0 then
+                table.insert(visibleSessions, {
+                    session = sess,
+                    filteredGames = filteredGames,
+                    wins = sWins,
+                    losses = sLosses,
+                    netRating = sNet,
+                    hasRating = sHasRating,
+                })
+                totalWins = totalWins + sWins
+                totalLosses = totalLosses + sLosses
+                totalNet = totalNet + sNet
+                if sHasRating then totalHasRating = true end
+                totalGamesCount = totalGamesCount + #filteredGames
+            end
         end
 
-        local dur = (game.startTime and game.endTime) and (game.endTime - game.startTime) or nil
-        row.duration:SetText(FormatDuration(dur))
-        row.duration:SetTextColor(0.8, 0.8, 0.8)
+        local totalHeight = 0
+        local sessionRowIdx = 0
+        local matchRowIdx = 0
 
-        row.timeStr:SetText(FormatTime(game.startTime))
-        row.timeStr:SetTextColor(0.6, 0.6, 0.6)
+        for _, vs in ipairs(visibleSessions) do
+            local sess = vs.session
 
-        row:Show()
-        totalHeight = totalHeight + ROW_HEIGHT
-    end
+            -- Session header
+            sessionRowIdx = sessionRowIdx + 1
+            local hdr = CreateSessionHeaderRow(sessionHeaderPool, sessionRowIdx)
+            hdr:SetPoint("TOPLEFT", 0, -totalHeight)
 
-    content:SetHeight(math.max(totalHeight, 1))
+            -- Date/time
+            local dateStr = sess.startTime and date("%b %d, %I:%M %p", sess.startTime) or "?"
+            hdr.dateText:SetText(dateStr)
 
-    -- Update title with win/loss count and net rating (from filtered results)
-    local wins, losses, netRating, hasRating = 0, 0, 0, false
-    for _, entry in ipairs(filtered) do
-        if entry.game.result == "WIN" then wins = wins + 1 else losses = losses + 1 end
-        if entry.game.ratingChange then
-            netRating = netRating + entry.game.ratingChange
-            hasRating = true
+            -- Game count
+            hdr.countText:SetText(#vs.filteredGames .. " games")
+
+            -- W/L record
+            local wlColor = vs.wins >= vs.losses and "|cff00ff00" or "|cffff0000"
+            hdr.recordText:SetText(wlColor .. vs.wins .. "W|r / |cffff0000" .. vs.losses .. "L|r")
+
+            -- Net rating
+            if vs.hasRating then
+                local sign = vs.netRating >= 0 and "+" or ""
+                local color = vs.netRating >= 0 and "|cff00ff00" or "|cffff0000"
+                hdr.ratingText:SetText(color .. sign .. vs.netRating .. "|r")
+            else
+                hdr.ratingText:SetText("")
+            end
+
+            -- Duration
+            local sessDur = (sess.startTime and sess.endTime) and (sess.endTime - sess.startTime) or nil
+            hdr.durationText:SetText(sessDur and FormatDuration(sessDur) or "")
+
+            -- Bracket
+            hdr.bracketText:SetText(sess.bracket or "")
+
+            -- Collapse arrow
+            local collapsed = sessionCollapsed[sess.startTime]
+            hdr.arrow:SetText(collapsed and ">" or "v")
+
+            hdr.sessionStartTime = sess.startTime
+            hdr:Show()
+            totalHeight = totalHeight + SESSION_HEADER_HEIGHT
+
+            -- Match rows (only if expanded)
+            if not collapsed then
+                for gIdx, entry in ipairs(vs.filteredGames) do
+                    matchRowIdx = matchRowIdx + 1
+                    local row = CreateMatchRow(sessionMatchRowPool, matchRowIdx)
+                    row:SetPoint("TOPLEFT", 0, -totalHeight)
+                    PopulateMatchRow(row, entry, gIdx)
+                    row:Show()
+                    totalHeight = totalHeight + ROW_HEIGHT
+                end
+            end
         end
-    end
-    local totalGames = #allGames
-    local shownGames = #filtered
-    local countStr = (shownGames < totalGames)
-        and (shownGames .. "/" .. totalGames .. " games")
-        or (totalGames .. " games")
-    local ratingStr = ""
-    if hasRating then
-        local sign = netRating >= 0 and "+" or ""
-        local color = netRating >= 0 and "|cff00ff00" or "|cffff0000"
-        ratingStr = " | Net: " .. color .. sign .. netRating .. "|r"
-    end
-    historyFrame.title:SetText("Trinketed — " .. countStr .. " (" ..
-        "|cff00ff00" .. wins .. "W|r / |cffff0000" .. losses .. "L|r)" .. ratingStr)
 
-    -- Update stats panel
-    RefreshStats(filtered)
+        ui.content:SetHeight(math.max(totalHeight, 1))
+
+        -- Sessions summary
+        local totalAllGames = #allGames
+        local countStr = (totalGamesCount < totalAllGames)
+            and (totalGamesCount .. "/" .. totalAllGames .. " games")
+            or (totalAllGames .. " games")
+        local ratingStr = ""
+        if totalHasRating then
+            local sign = totalNet >= 0 and "+" or ""
+            local color = totalNet >= 0 and "|cff00ff00" or "|cffff0000"
+            ratingStr = " | Net: " .. color .. sign .. totalNet .. "|r"
+        end
+        ui.summaryText:SetText(countStr .. ", " .. #visibleSessions .. " sessions (" ..
+            "|cff00ff00" .. totalWins .. "W|r / |cffff0000" .. totalLosses .. "L|r)" .. ratingStr)
+
+        -- Build filtered list for stats tab
+        lastFilteredList = {}
+        for _, vs in ipairs(visibleSessions) do
+            for _, entry in ipairs(vs.filteredGames) do
+                table.insert(lastFilteredList, entry)
+            end
+        end
+
+    else -- "history" tab
+        -- Hide stats frame, show scroll area
+        ui.statsFrame:Hide()
+        ui.scrollFrame:Show()
+
+        -- Show column headers
+        for _, fs in ipairs(ui.headerFontStrings or {}) do
+            fs:Show()
+        end
+        if ui.headerSep then ui.headerSep:Show() end
+
+        -- Apply filters — build list of {originalIndex, game} pairs, newest first
+        local filtered = {}
+        for i = #allGames, 1, -1 do
+            if GameMatchesFilters(allGames[i]) then
+                table.insert(filtered, { idx = i, game = allGames[i] })
+            end
+        end
+
+        local totalHeight = 0
+
+        for displayIdx = 1, #filtered do
+            local row = CreateMatchRow(rowPool, displayIdx)
+            row:SetPoint("TOPLEFT", 0, -((displayIdx - 1) * ROW_HEIGHT))
+            PopulateMatchRow(row, filtered[displayIdx], displayIdx)
+            row:Show()
+            totalHeight = totalHeight + ROW_HEIGHT
+        end
+
+        ui.content:SetHeight(math.max(totalHeight, 1))
+
+        -- Update summary with win/loss count and net rating (from filtered results)
+        local wins, losses, netRating, hasRating = 0, 0, 0, false
+        for _, entry in ipairs(filtered) do
+            if entry.game.result == "WIN" then wins = wins + 1 else losses = losses + 1 end
+            if entry.game.ratingChange then
+                netRating = netRating + entry.game.ratingChange
+                hasRating = true
+            end
+        end
+        local totalGames = #allGames
+        local shownGames = #filtered
+        local countStr = (shownGames < totalGames)
+            and (shownGames .. "/" .. totalGames .. " games")
+            or (totalGames .. " games")
+        local ratingStr = ""
+        if hasRating then
+            local sign = netRating >= 0 and "+" or ""
+            local color = netRating >= 0 and "|cff00ff00" or "|cffff0000"
+            ratingStr = " | Net: " .. color .. sign .. netRating .. "|r"
+        end
+        ui.summaryText:SetText(countStr .. " (" ..
+            "|cff00ff00" .. wins .. "W|r / |cffff0000" .. losses .. "L|r)" .. ratingStr)
+
+        lastFilteredList = filtered
+    end
 end
 
 local function ToggleHistory()
-    if historyFrame:IsShown() then
-        historyFrame:Hide()
-    else
-        RefreshHistory()
-        historyFrame:Show()
-    end
+    lib:ShowOptionsPanel("History")
 end
 
 ---------------------------------------------------------------------------
@@ -1811,7 +2296,7 @@ minimapButton:SetScript("OnClick", function(self, button)
     elseif button == "RightButton" then
         local count = TrinketedHistoryDB and #TrinketedHistoryDB.games or 0
         print("|cff00ccff" .. DISPLAY_NAME .. ":|r " .. count .. " games recorded.")
-        print("  /trinketed history — toggle game history window")
+        print("  /trinketed history — open game history")
         print("  /trinketed export — export game history")
         print("  /trinketed import — import game history")
         print("  /trinketed minimap — toggle minimap button")
@@ -1826,7 +2311,7 @@ minimapButton:SetScript("OnEnter", function(self)
     local count = TrinketedHistoryDB and #TrinketedHistoryDB.games or 0
     GameTooltip:AddLine(count .. " games recorded", 1, 1, 1)
     GameTooltip:AddLine(" ")
-    GameTooltip:AddLine("|cff00ff00Left-click|r to toggle history", 0.8, 0.8, 0.8)
+    GameTooltip:AddLine("|cff00ff00Left-click|r to open history", 0.8, 0.8, 0.8)
     GameTooltip:AddLine("|cff00ff00Ctrl+Left-click|r to export", 0.8, 0.8, 0.8)
     GameTooltip:AddLine("|cff00ff00Right-click|r for commands", 0.8, 0.8, 0.8)
     GameTooltip:AddLine("|cff00ff00Drag|r to reposition", 0.8, 0.8, 0.8)
@@ -2019,7 +2504,7 @@ ShowExportDialog = function()
     end
 
     local count = #TrinketedHistoryDB.games
-    local f = CreateFrame("Frame", "TrinketedExportFrame", UIParent, "BasicFrameTemplateWithInset")
+    local f = CreateFrame("Frame", "TrinketedExportFrame", UIParent, "BackdropTemplate")
     f:SetSize(520, 320)
     f:SetPoint("CENTER")
     f:SetFrameStrata("DIALOG")
@@ -2028,10 +2513,28 @@ ShowExportDialog = function()
     f:RegisterForDrag("LeftButton")
     f:SetScript("OnDragStart", f.StartMoving)
     f:SetScript("OnDragStop", f.StopMovingOrSizing)
+    f:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8x8", edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border", edgeSize = 14, insets = { left = 3, right = 3, top = 3, bottom = 3 } })
+    f:SetBackdropColor(C.frameBg[1], C.frameBg[2], C.frameBg[3], C.frameBg[4])
+    f:SetBackdropBorderColor(C.frameBorder[1], C.frameBorder[2], C.frameBorder[3], C.frameBorder[4])
 
-    f.title = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    f.title:SetPoint("TOP", 0, -5)
+    f.title = f:CreateFontString(nil, "OVERLAY")
+    f.title:SetFont(lib.FONT_DISPLAY, 12, "")
+    f.title:SetPoint("TOP", 0, -8)
+    f.title:SetTextColor(C.textBright[1], C.textBright[2], C.textBright[3])
     f.title:SetText("Trinketed Export — " .. count .. " games (" .. #str .. " chars)")
+
+    -- Custom close button
+    local closeBtn = CreateFrame("Button", nil, f)
+    closeBtn:SetSize(20, 20)
+    closeBtn:SetPoint("TOPRIGHT", -6, -6)
+    local closeTxt = closeBtn:CreateFontString(nil, "OVERLAY")
+    closeTxt:SetFont(lib.FONT_BODY, 14, "")
+    closeTxt:SetPoint("CENTER")
+    closeTxt:SetText("x")
+    closeTxt:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
+    closeBtn:SetScript("OnEnter", function() closeTxt:SetTextColor(C.accent[1], C.accent[2], C.accent[3]) end)
+    closeBtn:SetScript("OnLeave", function() closeTxt:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3]) end)
+    closeBtn:SetScript("OnClick", function() f:Hide() end)
 
     local scrollFrame = CreateFrame("ScrollFrame", nil, f, "UIPanelScrollFrameTemplate")
     scrollFrame:SetPoint("TOPLEFT", 12, -30)
@@ -2058,9 +2561,11 @@ ShowExportDialog = function()
     editBox:SetScript("OnChar", function(self) self:SetText(str); self:HighlightText() end)
 
     -- Hint text
-    local hint = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    local hint = f:CreateFontString(nil, "OVERLAY")
+    hint:SetFont(lib.FONT_BODY, 10, "")
     hint:SetPoint("BOTTOM", 0, 14)
-    hint:SetText("|cff999999Ctrl+A to select all, Ctrl+C to copy|r")
+    hint:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
+    hint:SetText("Ctrl+A to select all, Ctrl+C to copy")
 
     f:SetScript("OnHide", function(self) self:SetParent(nil) end)
     exportFrame = f
@@ -2069,7 +2574,7 @@ end
 ShowImportDialog = function()
     if importFrame then importFrame:Hide() end
 
-    local f = CreateFrame("Frame", "TrinketedImportFrame", UIParent, "BasicFrameTemplateWithInset")
+    local f = CreateFrame("Frame", "TrinketedImportFrame", UIParent, "BackdropTemplate")
     f:SetSize(520, 320)
     f:SetPoint("CENTER")
     f:SetFrameStrata("DIALOG")
@@ -2078,10 +2583,28 @@ ShowImportDialog = function()
     f:RegisterForDrag("LeftButton")
     f:SetScript("OnDragStart", f.StartMoving)
     f:SetScript("OnDragStop", f.StopMovingOrSizing)
+    f:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8x8", edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border", edgeSize = 14, insets = { left = 3, right = 3, top = 3, bottom = 3 } })
+    f:SetBackdropColor(C.frameBg[1], C.frameBg[2], C.frameBg[3], C.frameBg[4])
+    f:SetBackdropBorderColor(C.frameBorder[1], C.frameBorder[2], C.frameBorder[3], C.frameBorder[4])
 
-    f.title = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    f.title:SetPoint("TOP", 0, -5)
+    f.title = f:CreateFontString(nil, "OVERLAY")
+    f.title:SetFont(lib.FONT_DISPLAY, 12, "")
+    f.title:SetPoint("TOP", 0, -8)
+    f.title:SetTextColor(C.textBright[1], C.textBright[2], C.textBright[3])
     f.title:SetText("Trinketed Import — Paste string below")
+
+    -- Custom close button
+    local closeBtn = CreateFrame("Button", nil, f)
+    closeBtn:SetSize(20, 20)
+    closeBtn:SetPoint("TOPRIGHT", -6, -6)
+    local closeTxt = closeBtn:CreateFontString(nil, "OVERLAY")
+    closeTxt:SetFont(lib.FONT_BODY, 14, "")
+    closeTxt:SetPoint("CENTER")
+    closeTxt:SetText("x")
+    closeTxt:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
+    closeBtn:SetScript("OnEnter", function() closeTxt:SetTextColor(C.accent[1], C.accent[2], C.accent[3]) end)
+    closeBtn:SetScript("OnLeave", function() closeTxt:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3]) end)
+    closeBtn:SetScript("OnClick", function() f:Hide() end)
 
     local scrollFrame = CreateFrame("ScrollFrame", nil, f, "UIPanelScrollFrameTemplate")
     scrollFrame:SetPoint("TOPLEFT", 12, -30)
@@ -2097,10 +2620,8 @@ ShowImportDialog = function()
     scrollFrame:SetScrollChild(editBox)
 
     -- Import button
-    local btn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    btn:SetSize(120, 26)
+    local btn = CreateBrandButton(f, 120, 26, "Import", nil)
     btn:SetPoint("BOTTOM", 0, 14)
-    btn:SetText("Import")
     btn:SetScript("OnClick", function()
         local raw = editBox:GetText():trim()
         local data, err = ImportHistory(raw)
@@ -2127,14 +2648,16 @@ ShowImportDialog = function()
         -- Sort by startTime
         table.sort(TrinketedHistoryDB.games, function(a, b) return (a.startTime or 0) < (b.startTime or 0) end)
         print("|cff00ccff" .. DISPLAY_NAME .. ":|r Imported " .. added .. " new games (" .. #data.g .. " total in string, " .. (#data.g - added) .. " duplicates skipped).")
-        if historyFrame and historyFrame:IsShown() then RefreshHistory() end
+        if ui.built then RefreshHistory() end
         f:Hide()
     end)
 
     -- Hint text
-    local hint = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    local hint = f:CreateFontString(nil, "OVERLAY")
+    hint:SetFont(lib.FONT_BODY, 10, "")
     hint:SetPoint("BOTTOM", 0, 44)
-    hint:SetText("|cff999999Ctrl+V to paste, then click Import|r")
+    hint:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
+    hint:SetText("Ctrl+V to paste, then click Import")
 
     f:SetScript("OnHide", function(self) self:SetParent(nil) end)
     importFrame = f
@@ -2161,6 +2684,7 @@ frame:SetScript("OnEvent", function(self, event, ...)
             TrinketedHistoryDB = TrinketedHistoryDB or { games = {} }
             TrinketedHistoryDB.games = TrinketedHistoryDB.games or {}
             TrinketedHistoryDB.minimap = TrinketedHistoryDB.minimap or { minimapPos = 220, hide = false }
+            TrinketedHistoryDB.sessionGapThreshold = TrinketedHistoryDB.sessionGapThreshold or 1200
 
             -- Migrate data from old TrinketedDB.games if TrinketedHistoryDB is empty
             if #TrinketedHistoryDB.games == 0 and TrinketedDB and TrinketedDB.games and #TrinketedDB.games > 0 then
@@ -2393,7 +2917,7 @@ local function RegisterSubCommands()
         if args == "confirm" then
             local old = TrinketedHistoryDB and #TrinketedHistoryDB.games or 0
             TrinketedHistoryDB.games = {}
-            if historyFrame:IsShown() then RefreshHistory() end
+            if ui.built then RefreshHistory() end
             print("|cff00ccff" .. DISPLAY_NAME .. ":|r Cleared " .. old .. " games.")
         else
             print("|cff00ccff" .. DISPLAY_NAME .. ":|r |cffff4444This will delete ALL " .. #(TrinketedHistoryDB and TrinketedHistoryDB.games or {}) .. " recorded games.|r")
@@ -2424,6 +2948,22 @@ local function RegisterSubCommands()
     lib:RegisterSubCommand("hdebug", function()
         debugMode = not debugMode
         print("|cff00ccff" .. DISPLAY_NAME .. ":|r History debug mode " .. (debugMode and "|cff00ff00ON" or "|cffff0000OFF") .. "|r")
+    end)
+
+    lib:RegisterSubCommand("sessiongap", function(args)
+        if args and args ~= "" then
+            local val = tonumber(args)
+            if val and val >= 1 then
+                TrinketedHistoryDB.sessionGapThreshold = val * 60
+                print("|cff00ccff" .. DISPLAY_NAME .. ":|r Session gap set to " .. val .. " minutes (" .. (val * 60) .. "s).")
+                if ui.built then RefreshHistory() end
+            else
+                print("|cff00ccff" .. DISPLAY_NAME .. ":|r Invalid value. Usage: /trinketed sessiongap <minutes>")
+            end
+        else
+            local currentMins = math.floor((TrinketedHistoryDB.sessionGapThreshold or 1200) / 60)
+            print("|cff00ccff" .. DISPLAY_NAME .. ":|r Session gap threshold: " .. currentMins .. " minutes (" .. (TrinketedHistoryDB.sessionGapThreshold or 1200) .. "s).")
+        end
     end)
 
     lib:RegisterSubCommand("status", function()
@@ -2555,16 +3095,9 @@ end
 lib:RegisterSubAddon("History", {
     order = 2,
     OnSelect = function(contentFrame)
-        local C = lib.C
-        local info = contentFrame:CreateFontString(nil, "OVERLAY")
-        info:SetFont(lib.FONT_BODY, 12, "")
-        info:SetPoint("TOPLEFT", 20, -20)
-        info:SetTextColor(C.textNormal[1], C.textNormal[2], C.textNormal[3])
-        info:SetText("Arena match history and VOD timestamp overlay.\n\nUse |cffE8B923/trinketed history|r to open the history window.")
-
-        lib:CreateButton(contentFrame, 20, -70, 180, "Open History Window", function()
-            ToggleHistory()
-        end)
+        BuildHistoryUI(contentFrame)
+        contentFrame:SetScript("OnShow", function() RefreshHistory() end)
+        RefreshHistory()
     end,
 })
 

@@ -2,7 +2,7 @@
 ## Title: Trinketed - History
 ## Notes: Arena match history and VOD timestamps
 ## Author: apwek
-## Version: @project-version@
+## Version: v0.1.2
 ## Dependencies: Trinketed
 ## SavedVariables: TrinketedHistoryDB
 
