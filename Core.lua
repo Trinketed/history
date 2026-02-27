@@ -1065,6 +1065,91 @@ historyFrame.title = historyFrame:CreateFontString(nil, "OVERLAY", "GameFontHigh
 historyFrame.title:SetPoint("TOP", 0, -5)
 historyFrame.title:SetText("Trinketed — Arena History")
 
+---------------------------------------------------------------------------
+-- Tab Bar
+---------------------------------------------------------------------------
+local activeTab = "matches" -- "matches" or "sessions"
+
+-- Container frame for Matches tab content
+local matchesContainer = CreateFrame("Frame", nil, historyFrame)
+matchesContainer:SetPoint("TOPLEFT", 0, 0)
+matchesContainer:SetPoint("BOTTOMRIGHT", 0, 0)
+
+-- Container frame for Sessions tab content
+local sessionsContainer = CreateFrame("Frame", nil, historyFrame)
+sessionsContainer:SetPoint("TOPLEFT", 0, 0)
+sessionsContainer:SetPoint("BOTTOMRIGHT", 0, 0)
+sessionsContainer:Hide()
+
+local function CreateTab(parent, text, tabKey)
+    local tab = CreateFrame("Button", nil, parent)
+    tab:SetSize(80, 22)
+
+    tab.bg = tab:CreateTexture(nil, "BACKGROUND")
+    tab.bg:SetAllPoints()
+
+    tab.label = tab:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    tab.label:SetPoint("CENTER", 0, 0)
+    tab.label:SetText(text)
+
+    tab.tabKey = tabKey
+
+    tab:SetScript("OnEnter", function(self)
+        if activeTab ~= self.tabKey then
+            self.bg:SetColorTexture(0.15, 0.15, 0.15, 1)
+        end
+    end)
+    tab:SetScript("OnLeave", function(self)
+        if activeTab ~= self.tabKey then
+            self.bg:SetColorTexture(0.1, 0.1, 0.1, 0.5)
+        end
+    end)
+
+    return tab
+end
+
+local matchesTab = CreateTab(historyFrame, "Matches", "matches")
+matchesTab:SetPoint("TOPLEFT", 12, -22)
+
+local sessionsTab = CreateTab(historyFrame, "Sessions", "sessions")
+sessionsTab:SetPoint("LEFT", matchesTab, "RIGHT", 4, 0)
+
+-- Forward declarations for tab refresh functions
+local RefreshSessions
+
+local function UpdateTabAppearance()
+    if activeTab == "matches" then
+        matchesTab.bg:SetColorTexture(0.2, 0.2, 0.2, 1)
+        matchesTab.label:SetTextColor(1, 1, 1)
+        sessionsTab.bg:SetColorTexture(0.1, 0.1, 0.1, 0.5)
+        sessionsTab.label:SetTextColor(0.6, 0.6, 0.6)
+    else
+        sessionsTab.bg:SetColorTexture(0.2, 0.2, 0.2, 1)
+        sessionsTab.label:SetTextColor(1, 1, 1)
+        matchesTab.bg:SetColorTexture(0.1, 0.1, 0.1, 0.5)
+        matchesTab.label:SetTextColor(0.6, 0.6, 0.6)
+    end
+end
+
+local function SwitchTab(tabKey)
+    activeTab = tabKey
+    UpdateTabAppearance()
+    if tabKey == "matches" then
+        matchesContainer:Show()
+        sessionsContainer:Hide()
+        RefreshHistory()
+    else
+        matchesContainer:Hide()
+        sessionsContainer:Show()
+        if RefreshSessions then RefreshSessions() end
+    end
+end
+
+matchesTab:SetScript("OnClick", function() SwitchTab("matches") end)
+sessionsTab:SetScript("OnClick", function() SwitchTab("sessions") end)
+
+UpdateTabAppearance()
+
 -- Forward declare RefreshHistory so filter widgets can call it
 local RefreshHistory
 
@@ -1276,7 +1361,7 @@ end
 ---------------------------------------------------------------------------
 -- Filter Row 1: Player Comp | Partner | Enemy Comp
 ---------------------------------------------------------------------------
-local friendlyCompDD = CreateSearchableDropdown(historyFrame, "TkCompDD", 155, {
+local friendlyCompDD = CreateSearchableDropdown(matchesContainer, "TkCompDD", 155, {
     defaultLabel = "Player Comp: All",
     getOptions = function()
         local out = {}
@@ -1297,9 +1382,9 @@ local friendlyCompDD = CreateSearchableDropdown(historyFrame, "TkCompDD", 155, {
         return "Player Comp: " .. table.concat(t, ", ")
     end,
 })
-friendlyCompDD.frame:SetPoint("TOPLEFT", 12, -28)
+friendlyCompDD.frame:SetPoint("TOPLEFT", 12, -48)
 
-local partnerDD = CreateSearchableDropdown(historyFrame, "TkPartDD", 155, {
+local partnerDD = CreateSearchableDropdown(matchesContainer, "TkPartDD", 155, {
     defaultLabel = "Partner: All",
     getOptions = function()
         local out = {}
@@ -1320,9 +1405,9 @@ local partnerDD = CreateSearchableDropdown(historyFrame, "TkPartDD", 155, {
         return "Partner: " .. table.concat(t, ", ")
     end,
 })
-partnerDD.frame:SetPoint("TOPLEFT", 177, -28)
+partnerDD.frame:SetPoint("TOPLEFT", 177, -48)
 
-local enemyCompDD = CreateSearchableDropdown(historyFrame, "TkECompDD", 155, {
+local enemyCompDD = CreateSearchableDropdown(matchesContainer, "TkECompDD", 155, {
     defaultLabel = "Enemy Comp: All",
     getOptions = function()
         local out = {}
@@ -1343,12 +1428,12 @@ local enemyCompDD = CreateSearchableDropdown(historyFrame, "TkECompDD", 155, {
         return "Enemy Comp: " .. table.concat(t, ", ")
     end,
 })
-enemyCompDD.frame:SetPoint("TOPLEFT", 342, -28)
+enemyCompDD.frame:SetPoint("TOPLEFT", 342, -48)
 
 ---------------------------------------------------------------------------
 -- Filter Row 2: Enemy Players | Enemy Race | Result | Reset
 ---------------------------------------------------------------------------
-local enemyPlayerDD = CreateSearchableDropdown(historyFrame, "TkEPlrDD", 155, {
+local enemyPlayerDD = CreateSearchableDropdown(matchesContainer, "TkEPlrDD", 155, {
     defaultLabel = "Enemy Players: All",
     getOptions = function()
         local out = {}
@@ -1369,9 +1454,9 @@ local enemyPlayerDD = CreateSearchableDropdown(historyFrame, "TkEPlrDD", 155, {
         return "Enemy Players: " .. table.concat(t, ", ")
     end,
 })
-enemyPlayerDD.frame:SetPoint("TOPLEFT", 12, -54)
+enemyPlayerDD.frame:SetPoint("TOPLEFT", 12, -74)
 
-local enemyRaceDD = CreateSearchableDropdown(historyFrame, "TkERaceDD", 155, {
+local enemyRaceDD = CreateSearchableDropdown(matchesContainer, "TkERaceDD", 155, {
     defaultLabel = "Race: All",
     getOptions = function()
         local out = {}
@@ -1391,9 +1476,9 @@ local enemyRaceDD = CreateSearchableDropdown(historyFrame, "TkERaceDD", 155, {
         return "Race: " .. table.concat(t, ", ")
     end,
 })
-enemyRaceDD.frame:SetPoint("TOPLEFT", 177, -54)
+enemyRaceDD.frame:SetPoint("TOPLEFT", 177, -74)
 
-local resultDD = CreateSearchableDropdown(historyFrame, "TkResultDD", 155, {
+local resultDD = CreateSearchableDropdown(matchesContainer, "TkResultDD", 155, {
     defaultLabel = "Result: All",
     getOptions = function()
         return {
@@ -1417,19 +1502,19 @@ local resultDD = CreateSearchableDropdown(historyFrame, "TkResultDD", 155, {
         return "Result: All"
     end,
 })
-resultDD.frame:SetPoint("TOPLEFT", 342, -54)
+resultDD.frame:SetPoint("TOPLEFT", 342, -74)
 
-local exportBtn = CreateFrame("Button", nil, historyFrame, "UIPanelButtonTemplate")
+local exportBtn = CreateFrame("Button", nil, matchesContainer, "UIPanelButtonTemplate")
 exportBtn:SetSize(60, 22)
-exportBtn:SetPoint("TOPRIGHT", -80, -58)
+exportBtn:SetPoint("TOPRIGHT", -80, -78)
 exportBtn:SetNormalFontObject("GameFontNormalSmall")
 exportBtn:SetHighlightFontObject("GameFontHighlightSmall")
 exportBtn:SetText("Export")
 exportBtn:SetScript("OnClick", function() ShowExportDialog() end)
 
-local resetBtn = CreateFrame("Button", nil, historyFrame, "UIPanelButtonTemplate")
+local resetBtn = CreateFrame("Button", nil, matchesContainer, "UIPanelButtonTemplate")
 resetBtn:SetSize(60, 22)
-resetBtn:SetPoint("TOPRIGHT", -16, -58)
+resetBtn:SetPoint("TOPRIGHT", -16, -78)
 resetBtn:SetNormalFontObject("GameFontNormalSmall")
 resetBtn:SetHighlightFontObject("GameFontHighlightSmall")
 resetBtn:SetText("Reset")
@@ -1450,7 +1535,7 @@ resetBtn:SetScript("OnClick", function()
 end)
 
 -- Column headers
-local headerY = -84
+local headerY = -104
 local headers = {
     { text = "#",        x = 4,   w = 24, justify = "RIGHT" },
     { text = "Result",   x = 32,  w = 36, justify = "LEFT" },
@@ -1463,7 +1548,7 @@ local headers = {
 }
 for _, h in ipairs(headers) do
     if h.text ~= "" then
-        local fs = historyFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        local fs = matchesContainer:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
         fs:SetPoint("TOPLEFT", h.x, headerY)
         fs:SetWidth(h.w)
         fs:SetJustifyH(h.justify)
@@ -1473,14 +1558,14 @@ for _, h in ipairs(headers) do
 end
 
 -- Thin separator line below headers
-local headerSep = historyFrame:CreateTexture(nil, "ARTWORK")
+local headerSep = matchesContainer:CreateTexture(nil, "ARTWORK")
 headerSep:SetHeight(1)
 headerSep:SetPoint("TOPLEFT", 4, headerY - 12)
 headerSep:SetPoint("TOPRIGHT", -16, headerY - 12)
 headerSep:SetColorTexture(0.4, 0.4, 0.4, 0.5)
 
 -- Scroll frame
-local scrollFrame = CreateFrame("ScrollFrame", nil, historyFrame, "UIPanelScrollFrameTemplate")
+local scrollFrame = CreateFrame("ScrollFrame", nil, matchesContainer, "UIPanelScrollFrameTemplate")
 scrollFrame:SetPoint("TOPLEFT", 10, headerY - 14)
 scrollFrame:SetPoint("BOTTOMRIGHT", -30, 100)
 
@@ -1491,17 +1576,17 @@ scrollFrame:SetScrollChild(content)
 ---------------------------------------------------------------------------
 -- Stats Panel (bottom of history window)
 ---------------------------------------------------------------------------
-local statsSep = historyFrame:CreateTexture(nil, "ARTWORK")
+local statsSep = matchesContainer:CreateTexture(nil, "ARTWORK")
 statsSep:SetHeight(1)
 statsSep:SetPoint("BOTTOMLEFT", 8, 90)
 statsSep:SetPoint("BOTTOMRIGHT", -16, 90)
 statsSep:SetColorTexture(0.4, 0.4, 0.4, 0.5)
 
-local bestHeader = historyFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+local bestHeader = matchesContainer:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 bestHeader:SetPoint("BOTTOMLEFT", 14, 72)
 bestHeader:SetText("|cff00ff00Best Matchups|r")
 
-local worstHeader = historyFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+local worstHeader = matchesContainer:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 worstHeader:SetPoint("BOTTOMLEFT", 380, 72)
 worstHeader:SetText("|cffff4444Worst Matchups|r")
 
@@ -1581,8 +1666,8 @@ local bestRows = {}
 local worstRows = {}
 for i = 1, NUM_STAT_ROWS do
     local y = 72 - i * 12
-    bestRows[i] = CreateStatRow(historyFrame, 14, y)
-    worstRows[i] = CreateStatRow(historyFrame, 380, y)
+    bestRows[i] = CreateStatRow(matchesContainer, 14, y)
+    worstRows[i] = CreateStatRow(matchesContainer, 380, y)
 end
 
 local function RefreshStats(filteredList)
