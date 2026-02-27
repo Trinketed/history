@@ -2080,7 +2080,8 @@ sessScrollFrame:SetScrollChild(sessContent)
 
 local SESSION_ROW_HEIGHT = 28
 local MATCH_ROW_HEIGHT = 26
-local sessionRowPool = {}
+local sessionRowPool = {}   -- session summary rows
+local matchDrillPool = {}   -- match drill-down rows
 local expandedSession = nil -- stores startTime of expanded session for stable identity
 
 ---------------------------------------------------------------------------
@@ -2089,6 +2090,9 @@ local expandedSession = nil -- stores startTime of expanded session for stable i
 function RefreshSessions()
     -- Recycle existing rows
     for _, row in ipairs(sessionRowPool) do
+        row:Hide()
+    end
+    for _, row in ipairs(matchDrillPool) do
         row:Hide()
     end
 
@@ -2102,6 +2106,7 @@ function RefreshSessions()
 
     local totalHeight = 0
     local rowIdx = 0
+    local matchRowIdx = 0
     local totalGames = 0
     local totalWins = 0
     local totalLosses = 0
@@ -2280,12 +2285,12 @@ function RefreshSessions()
         -- Drill-down: render individual games if this session is expanded
         if isExpanded then
             for gi, game in ipairs(s.games) do
-                rowIdx = rowIdx + 1
-                local mrow = sessionRowPool[rowIdx]
+                matchRowIdx = matchRowIdx + 1
+                local mrow = matchDrillPool[matchRowIdx]
                 if not mrow then
                     mrow = CreateFrame("Frame", nil, sessContent)
                     mrow:SetSize(740, MATCH_ROW_HEIGHT)
-                    sessionRowPool[rowIdx] = mrow
+                    matchDrillPool[matchRowIdx] = mrow
 
                     mrow.result = mrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
                     mrow.result:SetPoint("LEFT", 40, 0)
