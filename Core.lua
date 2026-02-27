@@ -2265,7 +2265,7 @@ function RefreshSessions()
 
         -- Expand indicator
         local isExpanded = (expandedSession == s.startTime)
-        row.expandIndicator:SetText(isExpanded and "▼" or "▶")
+        row.expandIndicator:SetText(isExpanded and "-" or "+")
         row.expandIndicator:SetTextColor(0.5, 0.5, 0.5)
 
         -- OnClick: toggle drill-down (use startTime as stable identity)
