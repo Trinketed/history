@@ -2372,8 +2372,11 @@ function RefreshSessions()
                     for _, p in ipairs(game.enemyTeam) do
                         local color = CLASS_COLORS[p.class] or "ffffffff"
                         table.insert(enemyNames, "|c" .. color .. p.name .. "|r")
-                        local spec = p.spec and (SPEC_SHORT[p.spec] or p.spec) or nil
-                        table.insert(enemyDetails, spec and (spec .. " " .. (p.class or "?")) or (p.class or "?"))
+                        local detailParts = {}
+                        if p.spec then table.insert(detailParts, SPEC_SHORT[p.spec] or p.spec) end
+                        if p.race then table.insert(detailParts, RACE_SHORT[p.race] or p.race) end
+                        table.insert(detailParts, p.class or "?")
+                        table.insert(enemyDetails, table.concat(detailParts, " "))
                     end
                 elseif game.enemyComp then
                     for _, class in ipairs(game.enemyComp) do
