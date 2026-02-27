@@ -1997,7 +1997,7 @@ local sessionBracketDD = CreateSearchableDropdown(sessionsContainer, "TkSBracket
         return "Bracket: " .. sessionFilters.bracket
     end,
 })
-sessionBracketDD.frame:SetPoint("TOPLEFT", sessionsContainer, "TOPLEFT", 12, -24)
+sessionBracketDD.frame:SetPoint("TOPLEFT", sessionsContainer, "TOPLEFT", 12, -48)
 
 local sessionDaysDD = CreateSearchableDropdown(sessionsContainer, "TkSDaysDD", 120, {
     defaultLabel = "Time: All",
@@ -2039,7 +2039,7 @@ local sessionDaysDD = CreateSearchableDropdown(sessionsContainer, "TkSDaysDD", 1
 sessionDaysDD.frame:SetPoint("LEFT", sessionBracketDD.frame, "RIGHT", 10, 0)
 
 -- Session column headers
-local sessionHeaderY = -54
+local sessionHeaderY = -78
 local sessionHeaders = {
     { text = "#",        x = 4,   w = 24,  justify = "RIGHT" },
     { text = "Date",     x = 32,  w = 100, justify = "LEFT" },
