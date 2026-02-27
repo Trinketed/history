@@ -1963,6 +1963,7 @@ end
 local sessionFilters = {
     bracket = "All",
     days = 0,
+    partners = {},  -- table of name = true for selected partners (empty = all)
 }
 
 local sessionBracketDD = CreateSearchableDropdown(sessionsContainer, "TkSBracketDD", 120, {
@@ -2038,6 +2039,42 @@ local sessionDaysDD = CreateSearchableDropdown(sessionsContainer, "TkSDaysDD", 1
 })
 sessionDaysDD.frame:SetPoint("LEFT", sessionBracketDD.frame, "RIGHT", 10, 0)
 
+local sessionPartnerDD = CreateSearchableDropdown(sessionsContainer, "TkSPartnerDD", 155, {
+    defaultLabel = "Partner: All",
+    getOptions = function()
+        local playerName = UnitName("player")
+        local out = {}
+        local seen = {}
+        for _, game in ipairs(TrinketedHistoryDB and TrinketedHistoryDB.games or {}) do
+            for _, p in ipairs(game.friendlyTeam or {}) do
+                if p.name ~= playerName and not seen[p.name] then
+                    local color = CLASS_COLORS[p.class] or "ffffffff"
+                    table.insert(out, {
+                        key = p.name,
+                        text = "|c" .. color .. p.name .. "|r",
+                        searchText = p.name:lower(),
+                        isChecked = function() return sessionFilters.partners[p.name] == true end,
+                    })
+                    seen[p.name] = true
+                end
+            end
+        end
+        table.sort(out, function(a, b) return a.key < b.key end)
+        return out
+    end,
+    onToggle = function(key)
+        if sessionFilters.partners[key] then sessionFilters.partners[key] = nil else sessionFilters.partners[key] = true end
+        if RefreshSessions then RefreshSessions() end
+    end,
+    onClear = function() sessionFilters.partners = {}; if RefreshSessions then RefreshSessions() end end,
+    getLabel = function()
+        if not next(sessionFilters.partners) then return "Partner: All" end
+        local t = {}; for n in pairs(sessionFilters.partners) do table.insert(t, n) end
+        return "Partner: " .. table.concat(t, ", ")
+    end,
+})
+sessionPartnerDD.frame:SetPoint("LEFT", sessionDaysDD.frame, "RIGHT", 10, 0)
+
 -- Session column headers
 local sessionHeaderY = -78
 local sessionHeaders = {
@@ -2103,6 +2140,20 @@ function RefreshSessions()
     local daysFilter = sessionFilters.days
 
     local sessions = ComputeSessions(allGames, bracketFilter, daysFilter)
+
+    -- Filter by partner if any selected
+    if next(sessionFilters.partners) then
+        local filtered = {}
+        for _, s in ipairs(sessions) do
+            for _, p in ipairs(s.partners) do
+                if sessionFilters.partners[p.name] then
+                    table.insert(filtered, s)
+                    break
+                end
+            end
+        end
+        sessions = filtered
+    end
 
     local totalHeight = 0
     local rowIdx = 0
