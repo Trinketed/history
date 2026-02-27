@@ -2400,7 +2400,11 @@ local function ToggleHistory()
     if historyFrame:IsShown() then
         historyFrame:Hide()
     else
-        RefreshHistory()
+        if activeTab == "sessions" then
+            RefreshSessions()
+        else
+            RefreshHistory()
+        end
         historyFrame:Show()
     end
 end
@@ -2787,7 +2791,9 @@ ShowImportDialog = function()
         -- Sort by startTime
         table.sort(TrinketedHistoryDB.games, function(a, b) return (a.startTime or 0) < (b.startTime or 0) end)
         print("|cff00ccff" .. DISPLAY_NAME .. ":|r Imported " .. added .. " new games (" .. #data.g .. " total in string, " .. (#data.g - added) .. " duplicates skipped).")
-        if historyFrame and historyFrame:IsShown() then RefreshHistory() end
+        if historyFrame and historyFrame:IsShown() then
+            if activeTab == "sessions" then RefreshSessions() else RefreshHistory() end
+        end
         f:Hide()
     end)
 
@@ -3053,7 +3059,9 @@ local function RegisterSubCommands()
         if args == "confirm" then
             local old = TrinketedHistoryDB and #TrinketedHistoryDB.games or 0
             TrinketedHistoryDB.games = {}
-            if historyFrame:IsShown() then RefreshHistory() end
+            if historyFrame:IsShown() then
+                if activeTab == "sessions" then RefreshSessions() else RefreshHistory() end
+            end
             print("|cff00ccff" .. DISPLAY_NAME .. ":|r Cleared " .. old .. " games.")
         else
             print("|cff00ccff" .. DISPLAY_NAME .. ":|r |cffff4444This will delete ALL " .. #(TrinketedHistoryDB and TrinketedHistoryDB.games or {}) .. " recorded games.|r")
