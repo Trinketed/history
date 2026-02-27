@@ -2282,8 +2282,41 @@ function RefreshSessions()
         row:Show()
         totalHeight = totalHeight + SESSION_ROW_HEIGHT
 
-        -- Drill-down: render individual games if this session is expanded
+        -- Drill-down: render column header + individual games if expanded
         if isExpanded then
+            -- Column header row for drill-down
+            matchRowIdx = matchRowIdx + 1
+            local hrow = matchDrillPool[matchRowIdx]
+            if not hrow then
+                hrow = CreateFrame("Frame", nil, sessContent)
+                hrow:SetSize(740, 16)
+                matchDrillPool[matchRowIdx] = hrow
+                hrow.bg = hrow:CreateTexture(nil, "BACKGROUND")
+                hrow.bg:SetAllPoints()
+            end
+            hrow:SetPoint("TOPLEFT", 0, -totalHeight)
+            hrow.bg:SetColorTexture(0.06, 0.06, 0.10, 0.9)
+            -- Lazily create header labels
+            if not hrow.isHeader then
+                hrow.isHeader = true
+                local drillHeaders = {
+                    { text = "Result", x = 40,  w = 36 },
+                    { text = "Enemy",  x = 80,  w = 260 },
+                    { text = "Rating", x = 500, w = 50 },
+                    { text = "Dur",    x = 560, w = 45 },
+                    { text = "Time",   x = 620, w = 60 },
+                }
+                for _, dh in ipairs(drillHeaders) do
+                    local fs = hrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                    fs:SetPoint("LEFT", dh.x, 0)
+                    fs:SetWidth(dh.w)
+                    fs:SetJustifyH("LEFT")
+                    fs:SetText("|cff666666" .. dh.text .. "|r")
+                end
+            end
+            hrow:Show()
+            totalHeight = totalHeight + 16
+
             for gi, game in ipairs(s.games) do
                 matchRowIdx = matchRowIdx + 1
                 local mrow = matchDrillPool[matchRowIdx]
@@ -2294,38 +2327,27 @@ function RefreshSessions()
 
                     mrow.result = mrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
                     mrow.result:SetPoint("LEFT", 40, 0)
-                    mrow.result:SetWidth(30)
+                    mrow.result:SetWidth(36)
                     mrow.result:SetJustifyH("LEFT")
 
-                    mrow.friendly = mrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-                    mrow.friendly:SetPoint("LEFT", 74, 0)
-                    mrow.friendly:SetWidth(120)
-                    mrow.friendly:SetJustifyH("LEFT")
-                    mrow.friendly:SetWordWrap(false)
-
-                    mrow.vs = mrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-                    mrow.vs:SetPoint("LEFT", 198, 0)
-                    mrow.vs:SetWidth(20)
-                    mrow.vs:SetJustifyH("CENTER")
-
                     mrow.enemy = mrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-                    mrow.enemy:SetPoint("LEFT", 222, 0)
-                    mrow.enemy:SetWidth(120)
+                    mrow.enemy:SetPoint("LEFT", 80, 0)
+                    mrow.enemy:SetWidth(260)
                     mrow.enemy:SetJustifyH("LEFT")
                     mrow.enemy:SetWordWrap(false)
 
                     mrow.ratingChg = mrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-                    mrow.ratingChg:SetPoint("LEFT", 350, 0)
+                    mrow.ratingChg:SetPoint("LEFT", 500, 0)
                     mrow.ratingChg:SetWidth(50)
                     mrow.ratingChg:SetJustifyH("CENTER")
 
                     mrow.duration = mrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-                    mrow.duration:SetPoint("LEFT", 410, 0)
+                    mrow.duration:SetPoint("LEFT", 560, 0)
                     mrow.duration:SetWidth(45)
                     mrow.duration:SetJustifyH("CENTER")
 
                     mrow.timeStr = mrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-                    mrow.timeStr:SetPoint("LEFT", 465, 0)
+                    mrow.timeStr:SetPoint("LEFT", 620, 0)
                     mrow.timeStr:SetWidth(60)
                     mrow.timeStr:SetJustifyH("RIGHT")
 
@@ -2338,26 +2360,31 @@ function RefreshSessions()
 
                 -- Result
                 if game.result == "WIN" then
-                    mrow.result:SetText("|cff00ff00W|r")
+                    mrow.result:SetText("|cff00ff00WIN|r")
                 else
-                    mrow.result:SetText("|cffff0000L|r")
+                    mrow.result:SetText("|cffff0000LOSS|r")
                 end
 
-                -- Friendly team classes
-                mrow.friendly:SetText(FormatTeamClasses(game.friendlyTeam) or "?")
-
-                mrow.vs:SetText("|cff666666vs|r")
-
-                -- Enemy team classes
-                local enemyClasses = FormatTeamClasses(game.enemyTeam)
-                if not enemyClasses and game.enemyComp then
-                    local parts = {}
-                    for _, class in ipairs(game.enemyComp) do
-                        table.insert(parts, ColorClass(class))
+                -- Enemy team — class-colored names with spec/class subtitle
+                local enemyNames = {}
+                local enemyDetails = {}
+                if game.enemyTeam and #game.enemyTeam > 0 then
+                    for _, p in ipairs(game.enemyTeam) do
+                        local color = CLASS_COLORS[p.class] or "ffffffff"
+                        table.insert(enemyNames, "|c" .. color .. p.name .. "|r")
+                        local spec = p.spec and (SPEC_SHORT[p.spec] or p.spec) or nil
+                        table.insert(enemyDetails, spec and (spec .. " " .. (p.class or "?")) or (p.class or "?"))
                     end
-                    enemyClasses = #parts > 0 and table.concat(parts, " ") or "?"
+                elseif game.enemyComp then
+                    for _, class in ipairs(game.enemyComp) do
+                        table.insert(enemyNames, ColorClass(class))
+                    end
                 end
-                mrow.enemy:SetText(enemyClasses or "?")
+                local enemyStr = table.concat(enemyNames, ", ")
+                if #enemyDetails > 0 then
+                    enemyStr = enemyStr .. " |cff888888(" .. table.concat(enemyDetails, ", ") .. ")|r"
+                end
+                mrow.enemy:SetText(enemyStr ~= "" and enemyStr or "?")
 
                 -- Rating change
                 if game.ratingChange then
