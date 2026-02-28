@@ -341,7 +341,6 @@ local function ResetGameState()
         ratingBefore = nil,
         ratingAfter = nil,
         ratingChange = nil,
-        enemyMMR = nil,
     }
 end
 
@@ -391,23 +390,12 @@ local function SaveGame(result)
         end
     end
 
-    -- Capture enemy team MMR from GetBattlefieldTeamInfo
-    if GetBattlefieldTeamInfo then
-        local playerFaction = GetBattlefieldArenaFaction() or 0
-        local enemyFaction = (playerFaction == 0) and 1 or 0
-        local _, _, _, enemyMMR = GetBattlefieldTeamInfo(enemyFaction)
-        if enemyMMR and enemyMMR > 0 then
-            currentGame.enemyMMR = enemyMMR
-            dbg("  Enemy MMR:", enemyMMR)
-        end
-    end
-
-    -- Capture per-player ratings from the scoreboard
+    -- Capture per-player rating changes from the scoreboard
     if GetBattlefieldScore and GetNumBattlefieldScores then
         local playerFaction = GetBattlefieldArenaFaction()
         local numScores = GetNumBattlefieldScores() or 0
         for si = 1, numScores do
-            local name, _, _, _, _, faction, _, _, _, _, _, bgRating, ratingChange, preMatchMMR, mmrChange = GetBattlefieldScore(si)
+            local name, _, _, _, _, faction, _, _, _, _, _, _, ratingChange = GetBattlefieldScore(si)
             if name then
                 local cleanName = StripRealm(name)
                 -- Match scoreboard entries to our tracked players by name
@@ -415,10 +403,8 @@ local function SaveGame(result)
                     -- Enemy player
                     for _, p in ipairs(currentGame.enemyTeam) do
                         if p.name == cleanName then
-                            p.rating = bgRating
                             p.ratingChange = ratingChange
-                            p.mmr = preMatchMMR
-                            dbg("  Enemy scoreboard:", cleanName, "rating=" .. tostring(bgRating), "change=" .. tostring(ratingChange), "mmr=" .. tostring(preMatchMMR))
+                            dbg("  Enemy scoreboard:", cleanName, "ratingChange=" .. tostring(ratingChange))
                             break
                         end
                     end
@@ -426,10 +412,8 @@ local function SaveGame(result)
                     -- Friendly player
                     for _, p in ipairs(currentGame.friendlyTeam) do
                         if p.name == cleanName then
-                            p.rating = bgRating
                             p.ratingChange = ratingChange
-                            p.mmr = preMatchMMR
-                            dbg("  Friendly scoreboard:", cleanName, "rating=" .. tostring(bgRating), "change=" .. tostring(ratingChange), "mmr=" .. tostring(preMatchMMR))
+                            dbg("  Friendly scoreboard:", cleanName, "ratingChange=" .. tostring(ratingChange))
                             break
                         end
                     end
@@ -454,7 +438,6 @@ local function SaveGame(result)
         ratingBefore = currentGame.ratingBefore,
         ratingAfter = currentGame.ratingAfter,
         ratingChange = currentGame.ratingChange,
-        enemyMMR = currentGame.enemyMMR,
     })
 
     -- Flush combat log between games
@@ -471,9 +454,6 @@ local function SaveGame(result)
         local color = currentGame.ratingChange >= 0 and "|cff00ff00" or "|cffff0000"
         ratingStr = " " .. color .. "(" .. sign .. currentGame.ratingChange .. " rating, " ..
             (currentGame.ratingBefore or "?") .. "→" .. (currentGame.ratingAfter or "?") .. ")|r"
-        if currentGame.enemyMMR and currentGame.enemyMMR > 0 then
-            ratingStr = ratingStr .. " |cff888888vs " .. currentGame.enemyMMR .. " MMR|r"
-        end
     end
     print("|cff00ccff" .. DISPLAY_NAME .. ":|r Game #" .. count .. " recorded — " .. result .. ratingStr)
 
@@ -1902,17 +1882,11 @@ function RefreshHistory()
         end
         row.enemy:SetText(enemyStr)
 
-        -- Rating: show change + enemy MMR (e.g., "+16 vs 1820")
+        -- Rating: show change (e.g., "+16")
         if game.ratingChange then
             local sign = game.ratingChange >= 0 and "+" or ""
             local color = game.ratingChange >= 0 and "|cff00ff00" or "|cffff0000"
-            local ratingText = color .. sign .. game.ratingChange .. "|r"
-            if game.enemyMMR and game.enemyMMR > 0 then
-                ratingText = ratingText .. " |cff888888vs " .. game.enemyMMR .. "|r"
-            end
-            row.rating:SetText(ratingText)
-        elseif game.enemyMMR and game.enemyMMR > 0 then
-            row.rating:SetText("|cff888888vs " .. game.enemyMMR .. "|r")
+            row.rating:SetText(color .. sign .. game.ratingChange .. "|r")
         else
             row.rating:SetText("|cff555555—|r")
         end
@@ -2451,17 +2425,11 @@ function RefreshSessions()
                 end
                 mrow.enemy:SetText(enemyStr)
 
-                -- Rating: show change + enemy MMR
+                -- Rating: show change (e.g., "+16")
                 if game.ratingChange then
                     local sign = game.ratingChange >= 0 and "+" or ""
                     local color = game.ratingChange >= 0 and "|cff00ff00" or "|cffff0000"
-                    local ratingText = color .. sign .. game.ratingChange .. "|r"
-                    if game.enemyMMR and game.enemyMMR > 0 then
-                        ratingText = ratingText .. " |cff888888vs " .. game.enemyMMR .. "|r"
-                    end
-                    mrow.rating:SetText(ratingText)
-                elseif game.enemyMMR and game.enemyMMR > 0 then
-                    mrow.rating:SetText("|cff888888vs " .. game.enemyMMR .. "|r")
+                    mrow.rating:SetText(color .. sign .. game.ratingChange .. "|r")
                 else
                     mrow.rating:SetText("|cff555555—|r")
                 end
@@ -3225,17 +3193,16 @@ local function RegisterSubCommands()
             print("  ratingBefore:", tostring(currentGame.ratingBefore))
             print("  ratingAfter:", tostring(currentGame.ratingAfter))
             print("  ratingChange:", tostring(currentGame.ratingChange))
-            print("  enemyMMR:", tostring(currentGame.enemyMMR))
             for j, p in ipairs(currentGame.friendlyTeam) do
-                if p.rating or p.mmr then
+                if p.ratingChange then
                     local color = CLASS_COLORS[p.class] or "ffffffff"
-                    print("    friendly[" .. j .. "] |c" .. color .. p.name .. "|r rating=" .. tostring(p.rating) .. " mmr=" .. tostring(p.mmr) .. " change=" .. tostring(p.ratingChange))
+                    print("    friendly[" .. j .. "] |c" .. color .. p.name .. "|r ratingChange=" .. tostring(p.ratingChange))
                 end
             end
             for j, p in ipairs(currentGame.enemyTeam) do
-                if p.rating or p.mmr then
+                if p.ratingChange then
                     local color = CLASS_COLORS[p.class] or "ffffffff"
-                    print("    enemy[" .. j .. "] |c" .. color .. p.name .. "|r rating=" .. tostring(p.rating) .. " mmr=" .. tostring(p.mmr) .. " change=" .. tostring(p.ratingChange))
+                    print("    enemy[" .. j .. "] |c" .. color .. p.name .. "|r ratingChange=" .. tostring(p.ratingChange))
                 end
             end
         end
