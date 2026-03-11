@@ -1,0 +1,16 @@
+name: Notify Parent Repo
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger submodule update in parent repo
+        run: gh workflow run update-submodule.yml -R Trinketed/addon -f submodule=TrinketedHistory
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
