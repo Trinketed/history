@@ -17,6 +17,12 @@ local ARENA_ZONES = {
     ["Ruins of Lordaeron"] = true,
 }
 
+-- Spells only available via UNIT_SPELLCAST_SUCCEEDED (not in CLEU)
+local API_ONLY_SPELLS = {
+    [42292] = true,   -- PvP Trinket
+    [59752] = true,   -- Every Man for Himself
+}
+
 local ADDON_NAME = "TrinketedHistory"
 local DISPLAY_NAME = "Trinketed"
 local PREP_BUFF = "Arena Preparation"
@@ -343,11 +349,13 @@ local function ResetGameState()
     currentGame = {
         startTime = nil,
         endTime = nil,
+        startTimeExact = nil,  -- GetTime() when game starts (for CLEU ms offsets)
         map = GetRealZoneText(),
         enemyComp = {},
         result = nil,
         friendlyTeam = {},
         enemyTeam = {},
+        cleu = {},             -- captured combat log events
         ratingsBefore = nil,  -- { [1]=2v2, [2]=3v3, [3]=5v5 } snapshot before game
         bracket = nil,
         ratingBefore = nil,
@@ -467,6 +475,7 @@ local function SaveGame(result)
         ratingAfter = currentGame.ratingAfter,
         ratingChange = currentGame.ratingChange,
         enemyMMR = currentGame.enemyMMR,
+        cleu = currentGame.cleu,
     })
 
     -- Flush combat log between games
@@ -2302,12 +2311,13 @@ minimapButton:SetScript("OnClick", function(self, button)
         print("  /trinketed minimap — toggle minimap button")
         print("  /trinketed hdebug — toggle history debug logging")
         print("  /trinketed status — dump current state")
+        print("  /trinketed dumpcleu — dump CLEU capture (live or saved game #/-1)")
     end
 end)
 
 minimapButton:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_LEFT")
-    GameTooltip:AddLine("Trinketed", 0, 0.8, 1)
+    GameTooltip:AddLine("Trinketed Testing", 0, 0.8, 1)
     local count = TrinketedHistoryDB and #TrinketedHistoryDB.games or 0
     GameTooltip:AddLine(count .. " games recorded", 1, 1, 1)
     GameTooltip:AddLine(" ")
@@ -2462,7 +2472,7 @@ local function ExportHistory()
     if not TrinketedHistoryDB or not TrinketedHistoryDB.games or #TrinketedHistoryDB.games == 0 then
         return nil, "No games to export."
     end
-    local data = { v = 1, t = time(), g = TrinketedHistoryDB.games }
+    local data = { v = 2, t = time(), g = TrinketedHistoryDB.games }
     local json = TableToJSON(data)
     local compressed = LibDeflate:CompressZlib(json, { level = 9 })
     if not compressed then return nil, "Compression failed." end
@@ -2731,6 +2741,7 @@ frame:SetScript("OnEvent", function(self, event, ...)
                     -- Gates already opened, game is in progress
                     gameStarted = true
                     currentGame.startTime = time() -- approximate, we lost the real start time
+                    currentGame.startTimeExact = GetTime()
                     dbg("Reload recovery: game in progress")
                     print("|cff00ccff" .. DISPLAY_NAME .. ":|r Reload detected — arena game in progress. Resuming tracking (start time approximated).")
                 end
@@ -2785,6 +2796,7 @@ frame:SetScript("OnEvent", function(self, event, ...)
             -- Prep buff was removed = gates opened
             gameStarted = true
             currentGame.startTime = time()
+            currentGame.startTimeExact = GetTime()
             -- Snapshot all bracket ratings before the game
             currentGame.ratingsBefore = SnapshotAllRatings()
             dbg("Pre-game ratings snapshot:",
@@ -2846,9 +2858,28 @@ frame:SetScript("OnEvent", function(self, event, ...)
 
     elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
         if not inArena or not gameStarted then return end
-        local _, eventType, _, sourceGUID, _, _, _, destGUID, _, _, _, spellID, spellName = CombatLogGetCurrentEventInfo()
+        local timestamp, eventType, hideCaster,
+              sourceGUID, sourceName, sourceFlags, sourceRaidFlags,
+              destGUID, destName, destFlags, destRaidFlags = CombatLogGetCurrentEventInfo()
+
+        -- Capture full CLEU event into per-game array (stop after game result determined)
+        if currentGame and currentGame.cleu and currentGame.startTimeExact and not pendingSave then
+            local entry = {
+                math.floor((GetTime() - currentGame.startTimeExact) * 1000),  -- [1] ms offset
+                eventType,     -- [2]
+                sourceGUID,    -- [3]
+                sourceName,    -- [4]
+                sourceFlags,   -- [5]
+                destGUID,      -- [6]
+                destName,      -- [7]
+                destFlags,     -- [8]
+                select(12, CombatLogGetCurrentEventInfo())  -- [9+] spell prefix + suffix (varies by event)
+            }
+            table.insert(currentGame.cleu, entry)
+        end
 
         -- Try to discover unknown GUIDs from arena/party units
+        local spellID, spellName = select(12, CombatLogGetCurrentEventInfo())
         if sourceGUID and not guidToPlayer[sourceGUID] then
             DiscoverPlayerByGUID(sourceGUID)
         end
@@ -2867,6 +2898,32 @@ frame:SetScript("OnEvent", function(self, event, ...)
         if not unit or not spellID then return end
         local guid = UnitGUID(unit)
         if not guid then return end
+
+        -- Capture API-only spells (not in CLEU) into the combat log.
+        -- Dedup: only capture once per GUID+spellID per tick (event fires for multiple unitIDs).
+        -- Use 0/"" instead of nil to avoid sparse Lua arrays that break JSON serialization.
+        if API_ONLY_SPELLS[spellID] and currentGame and currentGame.cleu and currentGame.startTimeExact then
+            local ms = math.floor((GetTime() - currentGame.startTimeExact) * 1000)
+            local dominated = false
+            for i = #currentGame.cleu, math.max(1, #currentGame.cleu - 5), -1 do
+                local prev = currentGame.cleu[i]
+                if prev[1] == ms and prev[2] == "SPELL_CAST_SUCCESS" and prev[3] == guid and prev[9] == spellID then
+                    dominated = true
+                    break
+                end
+            end
+            if not dominated then
+                local spellName = GetSpellInfo(spellID)
+                table.insert(currentGame.cleu, {
+                    ms,
+                    "SPELL_CAST_SUCCESS",
+                    guid, UnitName(unit), 0,
+                    "", "", 0,
+                    spellID, spellName or "", 0,
+                })
+            end
+        end
+
         -- Try to discover if unknown
         if not guidToPlayer[guid] then
             DiscoverPlayerByGUID(guid)
@@ -3084,6 +3141,99 @@ local function RegisterSubCommands()
                 if aName then
                     print("    arena" .. i .. ": specID=" .. tostring(specID) .. " (" .. specName .. ") - " .. aName)
                 end
+            end
+        end
+    end)
+
+    lib:RegisterSubCommand("dumpcleu", function(args)
+        -- Dump CLEU capture state for debugging
+        local gameIdx = nil
+        if args and args ~= "" then
+            gameIdx = tonumber(args)
+        end
+
+        if gameIdx then
+            -- Dump from a saved game
+            if not TrinketedHistoryDB or not TrinketedHistoryDB.games then
+                print("|cff00ccff" .. DISPLAY_NAME .. ":|r No saved games.")
+                return
+            end
+            -- Negative index counts from end (-1 = last game)
+            if gameIdx < 0 then
+                gameIdx = #TrinketedHistoryDB.games + gameIdx + 1
+            end
+            if gameIdx < 1 or gameIdx > #TrinketedHistoryDB.games then
+                print("|cff00ccff" .. DISPLAY_NAME .. ":|r Game index out of range (1-" .. #TrinketedHistoryDB.games .. ")")
+                return
+            end
+            local game = TrinketedHistoryDB.games[gameIdx]
+            local cleu = game.cleu
+            if not cleu or #cleu == 0 then
+                print("|cff00ccff" .. DISPLAY_NAME .. ":|r Game #" .. gameIdx .. " has no CLEU data.")
+                return
+            end
+            print("|cff00ccff" .. DISPLAY_NAME .. ":|r Game #" .. gameIdx .. " CLEU dump (" .. #cleu .. " events):")
+            local showCount = math.min(10, #cleu)
+            for i = 1, showCount do
+                local entry = cleu[i]
+                local parts = {}
+                for j = 1, math.min(#entry, 12) do
+                    parts[j] = tostring(entry[j])
+                end
+                local suffix = ""
+                if #entry > 12 then
+                    suffix = " ... (+" .. (#entry - 12) .. " more)"
+                end
+                print("  [" .. i .. "] " .. table.concat(parts, ", ") .. suffix)
+            end
+            if #cleu > showCount then
+                print("  ... (" .. (#cleu - showCount) .. " more events)")
+            end
+            -- Show last event too if there are many
+            if #cleu > showCount then
+                local last = cleu[#cleu]
+                local parts = {}
+                for j = 1, math.min(#last, 12) do
+                    parts[j] = tostring(last[j])
+                end
+                print("  [" .. #cleu .. "] " .. table.concat(parts, ", "))
+            end
+        else
+            -- Dump live state
+            if not currentGame then
+                print("|cff00ccff" .. DISPLAY_NAME .. ":|r No active game.")
+                return
+            end
+            local cleu = currentGame.cleu
+            if not cleu or #cleu == 0 then
+                print("|cff00ccff" .. DISPLAY_NAME .. ":|r Active game has 0 CLEU events captured.")
+                print("  startTimeExact:", tostring(currentGame.startTimeExact))
+                return
+            end
+            print("|cff00ccff" .. DISPLAY_NAME .. ":|r Active game CLEU: " .. #cleu .. " events captured")
+            print("  startTimeExact:", tostring(currentGame.startTimeExact))
+            -- Show first 5 and last entry
+            local showCount = math.min(5, #cleu)
+            for i = 1, showCount do
+                local entry = cleu[i]
+                local parts = {}
+                for j = 1, math.min(#entry, 12) do
+                    parts[j] = tostring(entry[j])
+                end
+                local suffix = ""
+                if #entry > 12 then
+                    suffix = " ... (+" .. (#entry - 12) .. " more)"
+                end
+                print("  [" .. i .. "] " .. table.concat(parts, ", ") .. suffix)
+            end
+            if #cleu > showCount then
+                print("  ... (" .. (#cleu - showCount) .. " more events)")
+                local last = cleu[#cleu]
+                local parts = {}
+                for j = 1, math.min(#last, 12) do
+                    parts[j] = tostring(last[j])
+                end
+                print("  [" .. #cleu .. "] " .. table.concat(parts, ", "))
             end
         end
     end)
