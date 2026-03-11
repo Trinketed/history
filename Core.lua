@@ -6,6 +6,7 @@ TrinketedHistory = TrinketedHistory or {}
 local addon = TrinketedHistory
 
 local lib = LibStub("TrinketedLib-1.0")
+local C = lib.C
 
 ---------------------------------------------------------------------------
 -- Constants
@@ -18,6 +19,7 @@ local ARENA_ZONES = {
 
 local ADDON_NAME = "TrinketedHistory"
 local DISPLAY_NAME = "Trinketed"
+local BRANDED_TITLE = "|cffE8B923T|r|cffF4F4F5RINKETED|r History"
 local PREP_BUFF = "Arena Preparation"
 local ROW_HEIGHT = 34
 local CLASS_COLORS = {
@@ -882,6 +884,63 @@ local function ComputeSessions(games, bracketFilter, daysFilter)
     return sessions
 end
 
+---------------------------------------------------------------------------
+-- ComputeTeams: aggregate win/loss by partner combination + bracket
+---------------------------------------------------------------------------
+local function ComputeTeams(games, bracketFilter)
+    if not games or #games == 0 then return {} end
+
+    local me = UnitName("player")
+    local teamMap = {} -- key = "partnerNames|bracket"
+
+    for _, g in ipairs(games) do
+        if not bracketFilter or g.bracket == bracketFilter then
+            local pk = GetPartnerKey(g)
+            local bracket = g.bracket or "?"
+            local key = pk .. "|" .. bracket
+
+            if not teamMap[key] then
+                -- Collect partner info from this game
+                local partners = {}
+                for _, p in ipairs(g.friendlyTeam or {}) do
+                    if p.name ~= me then
+                        table.insert(partners, { name = p.name, class = p.class })
+                    end
+                end
+                teamMap[key] = {
+                    partners = partners,
+                    bracket = bracket,
+                    wins = 0,
+                    losses = 0,
+                    netRating = 0,
+                    totalGames = 0,
+                }
+            end
+
+            local t = teamMap[key]
+            t.totalGames = t.totalGames + 1
+            if g.result == "WIN" then
+                t.wins = t.wins + 1
+            elseif g.result == "LOSS" then
+                t.losses = t.losses + 1
+            end
+            t.netRating = t.netRating + (g.ratingChange or 0)
+        end
+    end
+
+    -- Convert to sorted array (most games first)
+    local teams = {}
+    for _, t in pairs(teamMap) do
+        table.insert(teams, t)
+    end
+    table.sort(teams, function(a, b)
+        if a.totalGames ~= b.totalGames then return a.totalGames > b.totalGames end
+        return a.wins > b.wins
+    end)
+
+    return teams
+end
+
 local function GameMatchesFilters(game)
     if filters.result and game.result ~= filters.result then
         return false
@@ -1035,106 +1094,53 @@ local ShowImportDialog
 ---------------------------------------------------------------------------
 -- History Window
 ---------------------------------------------------------------------------
-local historyFrame = CreateFrame("Frame", "TrinketedHistoryFrame", UIParent, "BasicFrameTemplateWithInset")
-historyFrame:SetSize(800, 560)
-historyFrame:SetPoint("CENTER")
-historyFrame:SetFrameStrata("DIALOG")
-historyFrame:SetMovable(true)
-historyFrame:EnableMouse(true)
-historyFrame:RegisterForDrag("LeftButton")
-historyFrame:SetScript("OnDragStart", historyFrame.StartMoving)
-historyFrame:SetScript("OnDragStop", historyFrame.StopMovingOrSizing)
-historyFrame:Hide()
-
-historyFrame.title = historyFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-historyFrame.title:SetPoint("TOP", 0, -5)
-historyFrame.title:SetText("Trinketed — Arena History")
+local historyFrame = lib:CreateWindowFrame("TrinketedHistoryFrame", {
+    width = 800, height = 560,
+    title = BRANDED_TITLE,
+})
+historyFrame.title = historyFrame.titleText
 
 ---------------------------------------------------------------------------
 -- Tab Bar
 ---------------------------------------------------------------------------
-local activeTab = "matches" -- "matches" or "sessions"
-
--- Container frame for Matches tab content
-local matchesContainer = CreateFrame("Frame", nil, historyFrame)
-matchesContainer:SetPoint("TOPLEFT", 0, 0)
-matchesContainer:SetPoint("BOTTOMRIGHT", 0, 0)
-
--- Container frame for Sessions tab content
-local sessionsContainer = CreateFrame("Frame", nil, historyFrame)
-sessionsContainer:SetPoint("TOPLEFT", 0, 0)
-sessionsContainer:SetPoint("BOTTOMRIGHT", 0, 0)
-sessionsContainer:Hide()
-
-local function CreateTab(parent, text, tabKey)
-    local tab = CreateFrame("Button", nil, parent)
-    tab:SetSize(80, 22)
-
-    tab.bg = tab:CreateTexture(nil, "BACKGROUND")
-    tab.bg:SetAllPoints()
-
-    tab.label = tab:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    tab.label:SetPoint("CENTER", 0, 0)
-    tab.label:SetText(text)
-
-    tab.tabKey = tabKey
-
-    tab:SetScript("OnEnter", function(self)
-        if activeTab ~= self.tabKey then
-            self.bg:SetColorTexture(0.15, 0.15, 0.15, 1)
-        end
-    end)
-    tab:SetScript("OnLeave", function(self)
-        if activeTab ~= self.tabKey then
-            self.bg:SetColorTexture(0.1, 0.1, 0.1, 0.5)
-        end
-    end)
-
-    return tab
-end
-
-local matchesTab = CreateTab(historyFrame, "Matches", "matches")
-matchesTab:SetPoint("TOPLEFT", 12, -22)
-
-local sessionsTab = CreateTab(historyFrame, "Sessions", "sessions")
-sessionsTab:SetPoint("LEFT", matchesTab, "RIGHT", 4, 0)
+local activeTab = "matches" -- "matches", "sessions", or "teams"
 
 -- Forward declarations for tab refresh functions
 local RefreshHistory
 local RefreshSessions
+local RefreshTeams
 
-local function UpdateTabAppearance()
-    if activeTab == "matches" then
-        matchesTab.bg:SetColorTexture(0.2, 0.2, 0.2, 1)
-        matchesTab.label:SetTextColor(1, 1, 1)
-        sessionsTab.bg:SetColorTexture(0.1, 0.1, 0.1, 0.5)
-        sessionsTab.label:SetTextColor(0.6, 0.6, 0.6)
-    else
-        sessionsTab.bg:SetColorTexture(0.2, 0.2, 0.2, 1)
-        sessionsTab.label:SetTextColor(1, 1, 1)
-        matchesTab.bg:SetColorTexture(0.1, 0.1, 0.1, 0.5)
-        matchesTab.label:SetTextColor(0.6, 0.6, 0.6)
-    end
-end
+-- Tab container anchored below the title divider
+local tabContainer = CreateFrame("Frame", nil, historyFrame)
+tabContainer:SetPoint("TOPLEFT", 6, -30)
+tabContainer:SetPoint("TOPRIGHT", -6, -30)
+tabContainer:SetPoint("BOTTOMLEFT", 6, 6)
+tabContainer:SetPoint("BOTTOMRIGHT", -6, 6)
 
-local function SwitchTab(tabKey)
-    activeTab = tabKey
-    UpdateTabAppearance()
-    if tabKey == "matches" then
-        matchesContainer:Show()
-        sessionsContainer:Hide()
-        RefreshHistory()
-    else
-        matchesContainer:Hide()
-        sessionsContainer:Show()
-        if RefreshSessions then RefreshSessions() end
-    end
-end
+local historyTabBar = lib:CreateTabBar(tabContainer, {
+    { "matches", "Matches" },
+    { "sessions", "Sessions" },
+    { "teams", "Teams" },
+}, {
+    height = 26,
+    tabWidth = 80,
+    onChange = function(key)
+        activeTab = key
+        if key == "matches" then
+            if RefreshHistory then RefreshHistory() end
+        elseif key == "sessions" then
+            if RefreshSessions then RefreshSessions() end
+        elseif key == "teams" then
+            if RefreshTeams then RefreshTeams() end
+        end
+    end,
+})
 
-matchesTab:SetScript("OnClick", function() SwitchTab("matches") end)
-sessionsTab:SetScript("OnClick", function() SwitchTab("sessions") end)
+local matchesContainer = historyTabBar.contents["matches"]
+local sessionsContainer = historyTabBar.contents["sessions"]
+local teamsContainer = historyTabBar.contents["teams"]
 
-UpdateTabAppearance()
+historyTabBar:SelectTab("matches")
 
 -- Format a comp key ("Disc Priest/Arms Warrior") into class-colored text
 local function FormatCompLabel(compKey)
@@ -1172,23 +1178,35 @@ local function CreateSearchableDropdown(parent, ddName, width, opts)
 
     local btnBg = btn:CreateTexture(nil, "BACKGROUND")
     btnBg:SetAllPoints()
-    btnBg:SetColorTexture(0.1, 0.1, 0.1, 1)
+    btnBg:SetColorTexture(C.bgRaised[1], C.bgRaised[2], C.bgRaised[3], 1)
 
-    local bdr = CreateFrame("Frame", nil, btn, "BackdropTemplate")
-    bdr:SetAllPoints()
-    bdr:SetBackdrop({ edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border", edgeSize = 12, insets = { left = 2, right = 2, top = 2, bottom = 2 } })
-    bdr:SetBackdropBorderColor(0.5, 0.5, 0.5, 0.8)
+    -- 1px border (matching brand pattern)
+    local bdrTop = btn:CreateTexture(nil, "ARTWORK")
+    bdrTop:SetPoint("TOPLEFT"); bdrTop:SetPoint("TOPRIGHT"); bdrTop:SetHeight(1)
+    bdrTop:SetColorTexture(C.borderSubtle[1], C.borderSubtle[2], C.borderSubtle[3], 1)
+    local bdrBot = btn:CreateTexture(nil, "ARTWORK")
+    bdrBot:SetPoint("BOTTOMLEFT"); bdrBot:SetPoint("BOTTOMRIGHT"); bdrBot:SetHeight(1)
+    bdrBot:SetColorTexture(C.borderSubtle[1], C.borderSubtle[2], C.borderSubtle[3], 1)
+    local bdrL = btn:CreateTexture(nil, "ARTWORK")
+    bdrL:SetPoint("TOPLEFT"); bdrL:SetPoint("BOTTOMLEFT"); bdrL:SetWidth(1)
+    bdrL:SetColorTexture(C.borderSubtle[1], C.borderSubtle[2], C.borderSubtle[3], 1)
+    local bdrR = btn:CreateTexture(nil, "ARTWORK")
+    bdrR:SetPoint("TOPRIGHT"); bdrR:SetPoint("BOTTOMRIGHT"); bdrR:SetWidth(1)
+    bdrR:SetColorTexture(C.borderSubtle[1], C.borderSubtle[2], C.borderSubtle[3], 1)
 
-    local lbl = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    local lbl = btn:CreateFontString(nil, "OVERLAY")
+    lbl:SetFont(lib.FONT_BODY, 10, "")
     lbl:SetPoint("LEFT", 6, 0)
     lbl:SetPoint("RIGHT", -16, 0)
     lbl:SetJustifyH("LEFT")
     lbl:SetWordWrap(false)
+    lbl:SetTextColor(C.textNormal[1], C.textNormal[2], C.textNormal[3])
 
-    local arrow = btn:CreateTexture(nil, "OVERLAY")
-    arrow:SetSize(10, 10)
+    local arrow = btn:CreateFontString(nil, "OVERLAY")
+    arrow:SetFont(lib.FONT_MONO, 8, "")
     arrow:SetPoint("RIGHT", -4, 0)
-    arrow:SetTexture("Interface\\ChatFrame\\ChatFrameExpandArrow")
+    arrow:SetText("v")
+    arrow:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
 
     function dd:SetLabel(text) lbl:SetText(text) end
     dd:SetLabel(opts.defaultLabel or "All")
@@ -1201,43 +1219,66 @@ local function CreateSearchableDropdown(parent, ddName, width, opts)
     bdrop:SetScript("OnClick", function() dd:Close() end)
 
     -- Popup frame
-    local popup = CreateFrame("Frame", ddName .. "Pop", UIParent, "BackdropTemplate")
+    local popup = CreateFrame("Frame", ddName .. "Pop", UIParent)
     popup:SetFrameStrata("FULLSCREEN_DIALOG")
     popup:SetClampedToScreen(true)
     popup:SetSize(width + 20, 200)
-    -- Solid background (no bgFile — tooltip texture has built-in transparency)
-    popup:SetBackdrop({ edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border", edgeSize = 14, insets = { left = 3, right = 3, top = 3, bottom = 3 } })
-    -- Manual solid background texture
+
     local popBg = popup:CreateTexture(nil, "BACKGROUND")
     popBg:SetAllPoints()
-    popBg:SetColorTexture(0.05, 0.05, 0.05, 1)
-    popup:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
+    popBg:SetColorTexture(C.sidebarBg[1], C.sidebarBg[2], C.sidebarBg[3], 1)
+
+    -- 1px border
+    local popBdrTop = popup:CreateTexture(nil, "ARTWORK")
+    popBdrTop:SetPoint("TOPLEFT"); popBdrTop:SetPoint("TOPRIGHT"); popBdrTop:SetHeight(1)
+    popBdrTop:SetColorTexture(C.borderDefault[1], C.borderDefault[2], C.borderDefault[3], 1)
+    local popBdrBot = popup:CreateTexture(nil, "ARTWORK")
+    popBdrBot:SetPoint("BOTTOMLEFT"); popBdrBot:SetPoint("BOTTOMRIGHT"); popBdrBot:SetHeight(1)
+    popBdrBot:SetColorTexture(C.borderDefault[1], C.borderDefault[2], C.borderDefault[3], 1)
+    local popBdrL = popup:CreateTexture(nil, "ARTWORK")
+    popBdrL:SetPoint("TOPLEFT"); popBdrL:SetPoint("BOTTOMLEFT"); popBdrL:SetWidth(1)
+    popBdrL:SetColorTexture(C.borderDefault[1], C.borderDefault[2], C.borderDefault[3], 1)
+    local popBdrR = popup:CreateTexture(nil, "ARTWORK")
+    popBdrR:SetPoint("TOPRIGHT"); popBdrR:SetPoint("BOTTOMRIGHT"); popBdrR:SetWidth(1)
+    popBdrR:SetColorTexture(C.borderDefault[1], C.borderDefault[2], C.borderDefault[3], 1)
+
     popup:Hide()
 
     -- "Clear All" button
     local clrBtn = CreateFrame("Button", nil, popup)
     clrBtn:SetSize(width + 10, SD_ROW_H)
     clrBtn:SetPoint("TOPLEFT", 5, -5)
-    local clrTxt = clrBtn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    local clrTxt = clrBtn:CreateFontString(nil, "OVERLAY")
+    clrTxt:SetFont(lib.FONT_BODY, 10, "")
     clrTxt:SetPoint("LEFT", 4, 0)
-    clrTxt:SetText("|cffaaaaaaAll (clear)|r")
+    clrTxt:SetText("All (clear)")
+    clrTxt:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
     local clrHL = clrBtn:CreateTexture(nil, "HIGHLIGHT")
     clrHL:SetAllPoints()
-    clrHL:SetColorTexture(1, 1, 1, 0.1)
+    clrHL:SetColorTexture(C.rowHover[1], C.rowHover[2], C.rowHover[3], C.rowHover[4])
     clrBtn:SetScript("OnClick", function()
         if opts.onClear then opts.onClear() end
         dd:Refresh()
     end)
 
     -- Search box
-    local sBox = CreateFrame("EditBox", ddName .. "Srch", popup, "InputBoxTemplate")
+    local sBox = CreateFrame("EditBox", ddName .. "Srch", popup)
     sBox:SetSize(width + 4, 18)
     sBox:SetPoint("TOPLEFT", 8, -5 - SD_ROW_H - 2)
     sBox:SetAutoFocus(false)
-    sBox:SetFontObject("GameFontNormalSmall")
-    local sPH = sBox:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
-    sPH:SetPoint("LEFT", 5, 0)
+    sBox:SetFont(lib.FONT_BODY, 10, "")
+    sBox:SetTextColor(C.textBright[1], C.textBright[2], C.textBright[3])
+    local sBoxBg = sBox:CreateTexture(nil, "BACKGROUND")
+    sBoxBg:SetAllPoints()
+    sBoxBg:SetColorTexture(C.bgRaised[1], C.bgRaised[2], C.bgRaised[3], 1)
+    local sBoxBdr = sBox:CreateTexture(nil, "ARTWORK")
+    sBoxBdr:SetPoint("BOTTOMLEFT"); sBoxBdr:SetPoint("BOTTOMRIGHT"); sBoxBdr:SetHeight(1)
+    sBoxBdr:SetColorTexture(C.borderDefault[1], C.borderDefault[2], C.borderDefault[3], 1)
+    local sPH = sBox:CreateFontString(nil, "ARTWORK")
+    sPH:SetFont(lib.FONT_BODY, 10, "")
+    sPH:SetPoint("LEFT", 2, 0)
     sPH:SetText("Search...")
+    sPH:SetTextColor(C.textMuted[1], C.textMuted[2], C.textMuted[3])
     sBox:SetScript("OnEditFocusGained", function() sPH:Hide() end)
     sBox:SetScript("OnEditFocusLost", function(self) if self:GetText() == "" then sPH:Show() end end)
     sBox:SetScript("OnEscapePressed", function() dd:Close() end)
@@ -1259,21 +1300,27 @@ local function CreateSearchableDropdown(parent, ddName, width, opts)
         r:SetSize(width - 10, SD_ROW_H)
         local hl = r:CreateTexture(nil, "HIGHLIGHT")
         hl:SetAllPoints()
-        hl:SetColorTexture(1, 1, 1, 0.1)
+        hl:SetColorTexture(C.rowHover[1], C.rowHover[2], C.rowHover[3], C.rowHover[4])
         r.chk = r:CreateTexture(nil, "OVERLAY")
-        r.chk:SetSize(12, 12)
-        r.chk:SetPoint("LEFT", 2, 0)
-        r.txt = r:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        r.txt:SetPoint("LEFT", 18, 0)
+        r.chk:SetSize(6, 6)
+        r.chk:SetPoint("LEFT", 4, 0)
+        r.txt = r:CreateFontString(nil, "OVERLAY")
+        r.txt:SetFont(lib.FONT_BODY, 10, "")
+        r.txt:SetPoint("LEFT", 16, 0)
         r.txt:SetPoint("RIGHT", -2, 0)
         r.txt:SetJustifyH("LEFT")
         r.txt:SetWordWrap(false)
+        r.txt:SetTextColor(C.textNormal[1], C.textNormal[2], C.textNormal[3])
         rowPool[idx] = r
         return r
     end
 
     local function SetChk(tex, on)
-        tex:SetTexture(on and "Interface\\Buttons\\UI-CheckBox-Check" or "Interface\\Buttons\\UI-CheckBox-Up")
+        if on then
+            tex:SetColorTexture(C.accent[1], C.accent[2], C.accent[3], 1)
+        else
+            tex:SetColorTexture(C.textDim[1], C.textDim[2], C.textDim[3], 0.6)
+        end
     end
 
     local function FilterDisplay()
@@ -1335,8 +1382,12 @@ local function CreateSearchableDropdown(parent, ddName, width, opts)
     btn:SetScript("OnClick", function()
         if popup:IsShown() then dd:Close() else dd:Open() end
     end)
-    btn:SetScript("OnEnter", function() btnBg:SetColorTexture(0.15, 0.15, 0.15, 1) end)
-    btn:SetScript("OnLeave", function() btnBg:SetColorTexture(0.1, 0.1, 0.1, 1) end)
+    btn:SetScript("OnEnter", function()
+        btnBg:SetColorTexture(C.bgElevated[1], C.bgElevated[2], C.bgElevated[3], 1)
+    end)
+    btn:SetScript("OnLeave", function()
+        btnBg:SetColorTexture(C.bgRaised[1], C.bgRaised[2], C.bgRaised[3], 1)
+    end)
 
     return dd
 end
@@ -1487,20 +1538,60 @@ local resultDD = CreateSearchableDropdown(matchesContainer, "TkResultDD", 155, {
 })
 resultDD.frame:SetPoint("TOPLEFT", 342, -74)
 
-local exportBtn = CreateFrame("Button", nil, matchesContainer, "UIPanelButtonTemplate")
-exportBtn:SetSize(60, 22)
-exportBtn:SetPoint("TOPRIGHT", -80, -78)
-exportBtn:SetNormalFontObject("GameFontNormalSmall")
-exportBtn:SetHighlightFontObject("GameFontHighlightSmall")
-exportBtn:SetText("Export")
+-- Export and Reset buttons (positioned from the right)
+local resetBtn = CreateFrame("Button", nil, matchesContainer)
+resetBtn:SetSize(60, 24)
+resetBtn:SetPoint("TOPRIGHT", -16, -76)
+do
+    local bg = resetBtn:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints()
+    bg:SetColorTexture(C.frameBg[1], C.frameBg[2], C.frameBg[3], 1)
+    local border = resetBtn:CreateTexture(nil, "ARTWORK")
+    border:SetPoint("TOPLEFT", -1, 1); border:SetPoint("BOTTOMRIGHT", 1, -1)
+    border:SetColorTexture(C.divider[1], C.divider[2], C.divider[3], C.divider[4])
+    local inner = resetBtn:CreateTexture(nil, "ARTWORK", nil, 1)
+    inner:SetAllPoints()
+    inner:SetColorTexture(C.frameBg[1], C.frameBg[2], C.frameBg[3], 1)
+    local label = resetBtn:CreateFontString(nil, "OVERLAY")
+    label:SetFont(lib.FONT_BODY, 10, ""); label:SetPoint("CENTER")
+    label:SetText("Reset"); label:SetTextColor(C.textNormal[1], C.textNormal[2], C.textNormal[3])
+    resetBtn:SetScript("OnEnter", function()
+        inner:SetColorTexture(C.tabActive[1], C.tabActive[2], C.tabActive[3], 1)
+        label:SetTextColor(C.accent[1], C.accent[2], C.accent[3])
+    end)
+    resetBtn:SetScript("OnLeave", function()
+        inner:SetColorTexture(C.frameBg[1], C.frameBg[2], C.frameBg[3], 1)
+        label:SetTextColor(C.textNormal[1], C.textNormal[2], C.textNormal[3])
+    end)
+end
+
+local exportBtn = CreateFrame("Button", nil, matchesContainer)
+exportBtn:SetSize(60, 24)
+exportBtn:SetPoint("RIGHT", resetBtn, "LEFT", -6, 0)
+do
+    local bg = exportBtn:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints()
+    bg:SetColorTexture(C.frameBg[1], C.frameBg[2], C.frameBg[3], 1)
+    local border = exportBtn:CreateTexture(nil, "ARTWORK")
+    border:SetPoint("TOPLEFT", -1, 1); border:SetPoint("BOTTOMRIGHT", 1, -1)
+    border:SetColorTexture(C.divider[1], C.divider[2], C.divider[3], C.divider[4])
+    local inner = exportBtn:CreateTexture(nil, "ARTWORK", nil, 1)
+    inner:SetAllPoints()
+    inner:SetColorTexture(C.frameBg[1], C.frameBg[2], C.frameBg[3], 1)
+    local label = exportBtn:CreateFontString(nil, "OVERLAY")
+    label:SetFont(lib.FONT_BODY, 10, ""); label:SetPoint("CENTER")
+    label:SetText("Export"); label:SetTextColor(C.textNormal[1], C.textNormal[2], C.textNormal[3])
+    exportBtn:SetScript("OnEnter", function()
+        inner:SetColorTexture(C.tabActive[1], C.tabActive[2], C.tabActive[3], 1)
+        label:SetTextColor(C.accent[1], C.accent[2], C.accent[3])
+    end)
+    exportBtn:SetScript("OnLeave", function()
+        inner:SetColorTexture(C.frameBg[1], C.frameBg[2], C.frameBg[3], 1)
+        label:SetTextColor(C.textNormal[1], C.textNormal[2], C.textNormal[3])
+    end)
+end
 exportBtn:SetScript("OnClick", function() ShowExportDialog() end)
 
-local resetBtn = CreateFrame("Button", nil, matchesContainer, "UIPanelButtonTemplate")
-resetBtn:SetSize(60, 22)
-resetBtn:SetPoint("TOPRIGHT", -16, -78)
-resetBtn:SetNormalFontObject("GameFontNormalSmall")
-resetBtn:SetHighlightFontObject("GameFontHighlightSmall")
-resetBtn:SetText("Reset")
 resetBtn:SetScript("OnClick", function()
     filters.friendlyComps = {}
     filters.partners = {}
@@ -1531,12 +1622,14 @@ local headers = {
 }
 for _, h in ipairs(headers) do
     if h.text ~= "" then
-        local fs = matchesContainer:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        local fs = matchesContainer:CreateFontString(nil, "OVERLAY")
+        fs:SetFont(lib.FONT_BODY, 10, "")
         fs:SetPoint("TOPLEFT", h.x, headerY)
         fs:SetWidth(h.w)
         fs:SetJustifyH(h.justify)
         fs:SetWordWrap(false)
-        fs:SetText("|cff888888" .. h.text .. "|r")
+        fs:SetText(h.text)
+        fs:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
     end
 end
 
@@ -1545,7 +1638,7 @@ local headerSep = matchesContainer:CreateTexture(nil, "ARTWORK")
 headerSep:SetHeight(1)
 headerSep:SetPoint("TOPLEFT", 4, headerY - 12)
 headerSep:SetPoint("TOPRIGHT", -16, headerY - 12)
-headerSep:SetColorTexture(0.4, 0.4, 0.4, 0.5)
+headerSep:SetColorTexture(C.divider[1], C.divider[2], C.divider[3], C.divider[4])
 
 -- Scroll frame
 local scrollFrame = CreateFrame("ScrollFrame", nil, matchesContainer, "UIPanelScrollFrameTemplate")
@@ -1563,15 +1656,19 @@ local statsSep = matchesContainer:CreateTexture(nil, "ARTWORK")
 statsSep:SetHeight(1)
 statsSep:SetPoint("BOTTOMLEFT", 8, 90)
 statsSep:SetPoint("BOTTOMRIGHT", -16, 90)
-statsSep:SetColorTexture(0.4, 0.4, 0.4, 0.5)
+statsSep:SetColorTexture(C.divider[1], C.divider[2], C.divider[3], C.divider[4])
 
-local bestHeader = matchesContainer:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+local bestHeader = matchesContainer:CreateFontString(nil, "OVERLAY")
+bestHeader:SetFont(lib.FONT_DISPLAY, 10, "")
 bestHeader:SetPoint("BOTTOMLEFT", 14, 72)
-bestHeader:SetText("|cff00ff00Best Matchups|r")
+bestHeader:SetText("Best Matchups")
+bestHeader:SetTextColor(C.statusSuccess[1], C.statusSuccess[2], C.statusSuccess[3])
 
-local worstHeader = matchesContainer:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+local worstHeader = matchesContainer:CreateFontString(nil, "OVERLAY")
+worstHeader:SetFont(lib.FONT_DISPLAY, 10, "")
 worstHeader:SetPoint("BOTTOMLEFT", 380, 72)
-worstHeader:SetText("|cffff4444Worst Matchups|r")
+worstHeader:SetText("Worst Matchups")
+worstHeader:SetTextColor(C.enemyRed[1], C.enemyRed[2], C.enemyRed[3])
 
 local NUM_STAT_ROWS = 5
 local STAT_COL_COMP = 0      -- comp name offset from row left
@@ -1584,19 +1681,23 @@ local STAT_ROW_WIDTH = 350
 local function CreateStatRow(parent, x, y)
     local row = {}
 
-    row.comp = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    row.comp = parent:CreateFontString(nil, "OVERLAY")
+    row.comp:SetFont(lib.FONT_BODY, 10, "")
     row.comp:SetPoint("BOTTOMLEFT", x + STAT_COL_COMP, y)
     row.comp:SetWidth(170)
     row.comp:SetJustifyH("LEFT")
     row.comp:SetWordWrap(false)
+    row.comp:SetTextColor(C.textNormal[1], C.textNormal[2], C.textNormal[3])
 
-    row.record = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    row.record = parent:CreateFontString(nil, "OVERLAY")
+    row.record:SetFont(lib.FONT_BODY, 10, "")
     row.record:SetPoint("BOTTOMLEFT", x + STAT_COL_RECORD, y)
     row.record:SetWidth(55)
     row.record:SetJustifyH("LEFT")
     row.record:SetWordWrap(false)
 
-    row.pct = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    row.pct = parent:CreateFontString(nil, "OVERLAY")
+    row.pct:SetFont(lib.FONT_BODY, 10, "")
     row.pct:SetPoint("BOTTOMLEFT", x + STAT_COL_PCT, y)
     row.pct:SetWidth(35)
     row.pct:SetJustifyH("RIGHT")
@@ -1606,7 +1707,7 @@ local function CreateStatRow(parent, x, y)
     row.barBg = parent:CreateTexture(nil, "ARTWORK")
     row.barBg:SetPoint("BOTTOMLEFT", parent, "BOTTOMLEFT", x + STAT_COL_BAR, y + 1)
     row.barBg:SetSize(STAT_BAR_WIDTH, 8)
-    row.barBg:SetColorTexture(0.15, 0.15, 0.15, 1)
+    row.barBg:SetColorTexture(C.bgElevated[1], C.bgElevated[2], C.bgElevated[3], 1)
 
     -- Win% bar fill
     row.barFill = parent:CreateTexture(nil, "OVERLAY")
@@ -1797,20 +1898,23 @@ function RefreshHistory()
 
         local row = rowPool[displayIdx]
         if not row then
-            row = CreateFrame("Frame", nil, content)
+            row = CreateFrame("Button", nil, content)
             row:SetSize(740, ROW_HEIGHT)
             rowPool[displayIdx] = row
 
-            row.index = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.index = row:CreateFontString(nil, "OVERLAY")
+            row.index:SetFont(lib.FONT_BODY, 10, "")
             row.index:SetPoint("LEFT", 4, 0)
             row.index:SetWidth(24)
             row.index:SetJustifyH("RIGHT")
 
-            row.result = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.result = row:CreateFontString(nil, "OVERLAY")
+            row.result:SetFont(lib.FONT_BODY, 10, "")
             row.result:SetPoint("LEFT", 32, 0)
             row.result:SetWidth(32)
 
-            row.friendly = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.friendly = row:CreateFontString(nil, "OVERLAY")
+            row.friendly:SetFont(lib.FONT_BODY, 10, "")
             row.friendly:SetPoint("LEFT", 68, 0)
             row.friendly:SetWidth(210)
             row.friendly:SetJustifyH("LEFT")
@@ -1818,13 +1922,15 @@ function RefreshHistory()
             row.friendly:SetNonSpaceWrap(false)
             row.friendly:SetWordWrap(true)
 
-            row.vs = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.vs = row:CreateFontString(nil, "OVERLAY")
+            row.vs:SetFont(lib.FONT_BODY, 10, "")
             row.vs:SetPoint("LEFT", 282, 0)
             row.vs:SetWidth(20)
             row.vs:SetJustifyH("CENTER")
-            row.vs:SetTextColor(0.4, 0.4, 0.4)
+            row.vs:SetTextColor(C.textMuted[1], C.textMuted[2], C.textMuted[3])
 
-            row.enemy = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.enemy = row:CreateFontString(nil, "OVERLAY")
+            row.enemy:SetFont(lib.FONT_BODY, 10, "")
             row.enemy:SetPoint("LEFT", 305, 0)
             row.enemy:SetWidth(210)
             row.enemy:SetJustifyH("LEFT")
@@ -1832,17 +1938,20 @@ function RefreshHistory()
             row.enemy:SetNonSpaceWrap(false)
             row.enemy:SetWordWrap(true)
 
-            row.rating = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.rating = row:CreateFontString(nil, "OVERLAY")
+            row.rating:SetFont(lib.FONT_BODY, 10, "")
             row.rating:SetPoint("LEFT", 520, 0)
             row.rating:SetWidth(95)
             row.rating:SetJustifyH("CENTER")
 
-            row.duration = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.duration = row:CreateFontString(nil, "OVERLAY")
+            row.duration:SetFont(lib.FONT_BODY, 10, "")
             row.duration:SetPoint("LEFT", 620, 0)
             row.duration:SetWidth(45)
             row.duration:SetJustifyH("CENTER")
 
-            row.timeStr = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.timeStr = row:CreateFontString(nil, "OVERLAY")
+            row.timeStr:SetFont(lib.FONT_BODY, 10, "")
             row.timeStr:SetPoint("LEFT", 670, 0)
             row.timeStr:SetWidth(60)
             row.timeStr:SetJustifyH("RIGHT")
@@ -1850,19 +1959,24 @@ function RefreshHistory()
             -- Alternating background
             row.bg = row:CreateTexture(nil, "BACKGROUND")
             row.bg:SetAllPoints()
+
+            -- Hover highlight
+            local hl = row:CreateTexture(nil, "HIGHLIGHT")
+            hl:SetAllPoints()
+            hl:SetColorTexture(C.rowHover[1], C.rowHover[2], C.rowHover[3], C.rowHover[4])
         end
 
         row:SetPoint("TOPLEFT", 0, -((displayIdx - 1) * ROW_HEIGHT))
 
         -- Alternating row color
         if displayIdx % 2 == 0 then
-            row.bg:SetColorTexture(1, 1, 1, 0.05)
+            row.bg:SetColorTexture(C.rowHover[1], C.rowHover[2], C.rowHover[3], C.rowHover[4])
         else
             row.bg:SetColorTexture(0, 0, 0, 0)
         end
 
         row.index:SetText("#" .. i)
-        row.index:SetTextColor(0.5, 0.5, 0.5)
+        row.index:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
 
         if game.result == "WIN" then
             row.result:SetText("|cff00ff00WIN|r")
@@ -1898,10 +2012,10 @@ function RefreshHistory()
 
         local dur = (game.startTime and game.endTime) and (game.endTime - game.startTime) or nil
         row.duration:SetText(FormatDuration(dur))
-        row.duration:SetTextColor(0.8, 0.8, 0.8)
+        row.duration:SetTextColor(C.textNormal[1], C.textNormal[2], C.textNormal[3])
 
         row.timeStr:SetText(FormatTime(game.startTime))
-        row.timeStr:SetTextColor(0.6, 0.6, 0.6)
+        row.timeStr:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
 
         row:Show()
         totalHeight = totalHeight + ROW_HEIGHT
@@ -1929,7 +2043,7 @@ function RefreshHistory()
         local color = netRating >= 0 and "|cff00ff00" or "|cffff0000"
         ratingStr = " | Net: " .. color .. sign .. netRating .. "|r"
     end
-    historyFrame.title:SetText("Trinketed — " .. countStr .. " (" ..
+    historyFrame.title:SetText(BRANDED_TITLE .. " — " .. countStr .. " (" ..
         "|cff00ff00" .. wins .. "W|r / |cffff0000" .. losses .. "L|r)" .. ratingStr)
 
     -- Update stats panel
@@ -2066,15 +2180,18 @@ local sessionHeaders = {
     { text = "Win%",     x = 455, w = 45,  justify = "CENTER" },
     { text = "Rating",   x = 505, w = 120, justify = "CENTER" },
     { text = "Net",      x = 630, w = 50,  justify = "CENTER" },
+    { text = "",         x = 690, w = 30,  justify = "CENTER" },
 }
 for _, h in ipairs(sessionHeaders) do
     if h.text ~= "" then
-        local fs = sessionsContainer:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        local fs = sessionsContainer:CreateFontString(nil, "OVERLAY")
+        fs:SetFont(lib.FONT_BODY, 10, "")
         fs:SetPoint("TOPLEFT", h.x, sessionHeaderY)
         fs:SetWidth(h.w)
         fs:SetJustifyH(h.justify)
         fs:SetWordWrap(false)
-        fs:SetText("|cff888888" .. h.text .. "|r")
+        fs:SetText(h.text)
+        fs:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
     end
 end
 
@@ -2083,7 +2200,7 @@ local sessHeaderSep = sessionsContainer:CreateTexture(nil, "ARTWORK")
 sessHeaderSep:SetHeight(1)
 sessHeaderSep:SetPoint("TOPLEFT", 4, sessionHeaderY - 12)
 sessHeaderSep:SetPoint("TOPRIGHT", -16, sessionHeaderY - 12)
-sessHeaderSep:SetColorTexture(0.4, 0.4, 0.4, 0.5)
+sessHeaderSep:SetColorTexture(C.divider[1], C.divider[2], C.divider[3], C.divider[4])
 
 -- Sessions scroll frame
 local sessScrollFrame = CreateFrame("ScrollFrame", nil, sessionsContainer, "UIPanelScrollFrameTemplate")
@@ -2163,57 +2280,67 @@ function RefreshSessions()
             row:SetSize(740, SESSION_ROW_HEIGHT)
             sessionRowPool[rowIdx] = row
 
-            row.index = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.index = row:CreateFontString(nil, "OVERLAY")
+            row.index:SetFont(lib.FONT_BODY, 10, "")
             row.index:SetPoint("LEFT", 4, 0)
             row.index:SetWidth(24)
             row.index:SetJustifyH("RIGHT")
 
-            row.dateStr = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.dateStr = row:CreateFontString(nil, "OVERLAY")
+            row.dateStr:SetFont(lib.FONT_BODY, 10, "")
             row.dateStr:SetPoint("LEFT", 32, 0)
             row.dateStr:SetWidth(100)
             row.dateStr:SetJustifyH("LEFT")
             row.dateStr:SetWordWrap(false)
 
-            row.partners = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.partners = row:CreateFontString(nil, "OVERLAY")
+            row.partners:SetFont(lib.FONT_BODY, 10, "")
             row.partners:SetPoint("LEFT", 136, 0)
             row.partners:SetWidth(160)
             row.partners:SetJustifyH("LEFT")
             row.partners:SetWordWrap(false)
 
-            row.bracket = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.bracket = row:CreateFontString(nil, "OVERLAY")
+            row.bracket:SetFont(lib.FONT_BODY, 10, "")
             row.bracket:SetPoint("LEFT", 300, 0)
             row.bracket:SetWidth(50)
             row.bracket:SetJustifyH("CENTER")
 
-            row.games = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.games = row:CreateFontString(nil, "OVERLAY")
+            row.games:SetFont(lib.FONT_BODY, 10, "")
             row.games:SetPoint("LEFT", 355, 0)
             row.games:SetWidth(40)
             row.games:SetJustifyH("CENTER")
 
-            row.wl = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.wl = row:CreateFontString(nil, "OVERLAY")
+            row.wl:SetFont(lib.FONT_BODY, 10, "")
             row.wl:SetPoint("LEFT", 400, 0)
             row.wl:SetWidth(50)
             row.wl:SetJustifyH("CENTER")
 
-            row.winPct = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.winPct = row:CreateFontString(nil, "OVERLAY")
+            row.winPct:SetFont(lib.FONT_BODY, 10, "")
             row.winPct:SetPoint("LEFT", 455, 0)
             row.winPct:SetWidth(45)
             row.winPct:SetJustifyH("CENTER")
 
-            row.rating = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.rating = row:CreateFontString(nil, "OVERLAY")
+            row.rating:SetFont(lib.FONT_BODY, 10, "")
             row.rating:SetPoint("LEFT", 505, 0)
             row.rating:SetWidth(120)
             row.rating:SetJustifyH("CENTER")
             row.rating:SetWordWrap(false)
 
-            row.net = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            row.net = row:CreateFontString(nil, "OVERLAY")
+            row.net:SetFont(lib.FONT_BODY, 10, "")
             row.net:SetPoint("LEFT", 630, 0)
             row.net:SetWidth(50)
             row.net:SetJustifyH("CENTER")
 
-            row.expandIndicator = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-            row.expandIndicator:SetPoint("RIGHT", -4, 0)
-            row.expandIndicator:SetWidth(16)
+            row.expandIndicator = row:CreateFontString(nil, "OVERLAY")
+            row.expandIndicator:SetFont(lib.FONT_BODY, 10, "")
+            row.expandIndicator:SetPoint("LEFT", 690, 0)
+            row.expandIndicator:SetWidth(30)
             row.expandIndicator:SetJustifyH("CENTER")
 
             row.bg = row:CreateTexture(nil, "BACKGROUND")
@@ -2222,23 +2349,30 @@ function RefreshSessions()
             -- Highlight on hover
             local hl = row:CreateTexture(nil, "HIGHLIGHT")
             hl:SetAllPoints()
-            hl:SetColorTexture(1, 1, 1, 0.05)
+            hl:SetColorTexture(C.rowHover[1], C.rowHover[2], C.rowHover[3], C.rowHover[4])
+
+            row:SetScript("OnEnter", function()
+                row.expandIndicator:SetTextColor(C.accent[1], C.accent[2], C.accent[3])
+            end)
+            row:SetScript("OnLeave", function()
+                row.expandIndicator:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
+            end)
         end
 
         row:SetPoint("TOPLEFT", 0, -totalHeight)
 
         -- Alternating row color
         if displayNum % 2 == 0 then
-            row.bg:SetColorTexture(1, 1, 1, 0.05)
+            row.bg:SetColorTexture(C.rowHover[1], C.rowHover[2], C.rowHover[3], C.rowHover[4])
         else
             row.bg:SetColorTexture(0, 0, 0, 0)
         end
 
         row.index:SetText("#" .. displayNum)
-        row.index:SetTextColor(0.5, 0.5, 0.5)
+        row.index:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
 
         row.dateStr:SetText(date("%m/%d %H:%M", s.startTime))
-        row.dateStr:SetTextColor(0.7, 0.7, 0.7)
+        row.dateStr:SetTextColor(C.textNormal[1], C.textNormal[2], C.textNormal[3])
 
         -- Partners: class-colored names joined by ", " or "Solo"
         if s.partners and #s.partners > 0 then
@@ -2253,10 +2387,10 @@ function RefreshSessions()
         end
 
         row.bracket:SetText(s.bracket or "?")
-        row.bracket:SetTextColor(0.9, 0.9, 0.9)
+        row.bracket:SetTextColor(C.textBright[1], C.textBright[2], C.textBright[3])
 
         row.games:SetText(#s.games)
-        row.games:SetTextColor(0.9, 0.9, 0.9)
+        row.games:SetTextColor(C.textBright[1], C.textBright[2], C.textBright[3])
 
         row.wl:SetText("|cff00ff00" .. s.wins .. "|r-|cffff0000" .. s.losses .. "|r")
 
@@ -2277,7 +2411,7 @@ function RefreshSessions()
 
         -- Rating: startRating -> endRating
         if s.ratingStart and s.ratingEnd then
-            row.rating:SetText("|cffcccccc" .. s.ratingStart .. " → " .. s.ratingEnd .. "|r")
+            row.rating:SetText("|cffcccccc" .. s.ratingStart .. " -> " .. s.ratingEnd .. "|r")
         else
             row.rating:SetText("|cff555555—|r")
         end
@@ -2295,8 +2429,8 @@ function RefreshSessions()
 
         -- Expand indicator
         local isExpanded = (expandedSession == s.startTime)
-        row.expandIndicator:SetText(isExpanded and "-" or "+")
-        row.expandIndicator:SetTextColor(0.5, 0.5, 0.5)
+        row.expandIndicator:SetText(isExpanded and "v" or ">")
+        row.expandIndicator:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
 
         -- OnClick: toggle drill-down (use startTime as stable identity)
         local capturedStartTime = s.startTime
@@ -2326,7 +2460,7 @@ function RefreshSessions()
                 hrow.bg:SetAllPoints()
             end
             hrow:SetPoint("TOPLEFT", 0, -totalHeight)
-            hrow.bg:SetColorTexture(0.06, 0.06, 0.10, 0.9)
+            hrow.bg:SetColorTexture(C.sidebarBg[1], C.sidebarBg[2], C.sidebarBg[3], 0.9)
             if not hrow.isHeader then
                 hrow.isHeader = true
                 local drillHeaders = {
@@ -2340,11 +2474,13 @@ function RefreshSessions()
                 }
                 for _, dh in ipairs(drillHeaders) do
                     if dh.text ~= "" then
-                        local fs = hrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                        local fs = hrow:CreateFontString(nil, "OVERLAY")
+                        fs:SetFont(lib.FONT_BODY, 10, "")
                         fs:SetPoint("LEFT", dh.x, 0)
                         fs:SetWidth(dh.w)
                         fs:SetJustifyH(dh.justify)
-                        fs:SetText("|cff666666" .. dh.text .. "|r")
+                        fs:SetText(dh.text)
+                        fs:SetTextColor(C.textMuted[1], C.textMuted[2], C.textMuted[3])
                     end
                 end
             end
@@ -2355,15 +2491,17 @@ function RefreshSessions()
                 matchRowIdx = matchRowIdx + 1
                 local mrow = matchDrillPool[matchRowIdx]
                 if not mrow then
-                    mrow = CreateFrame("Frame", nil, sessContent)
+                    mrow = CreateFrame("Button", nil, sessContent)
                     mrow:SetSize(740, ROW_HEIGHT)
                     matchDrillPool[matchRowIdx] = mrow
 
-                    mrow.result = mrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                    mrow.result = mrow:CreateFontString(nil, "OVERLAY")
+                    mrow.result:SetFont(lib.FONT_BODY, 10, "")
                     mrow.result:SetPoint("LEFT", 32, 0)
                     mrow.result:SetWidth(32)
 
-                    mrow.friendly = mrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                    mrow.friendly = mrow:CreateFontString(nil, "OVERLAY")
+                    mrow.friendly:SetFont(lib.FONT_BODY, 10, "")
                     mrow.friendly:SetPoint("LEFT", 68, 0)
                     mrow.friendly:SetWidth(210)
                     mrow.friendly:SetJustifyH("LEFT")
@@ -2371,13 +2509,15 @@ function RefreshSessions()
                     mrow.friendly:SetNonSpaceWrap(false)
                     mrow.friendly:SetWordWrap(true)
 
-                    mrow.vs = mrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                    mrow.vs = mrow:CreateFontString(nil, "OVERLAY")
+                    mrow.vs:SetFont(lib.FONT_BODY, 10, "")
                     mrow.vs:SetPoint("LEFT", 282, 0)
                     mrow.vs:SetWidth(20)
                     mrow.vs:SetJustifyH("CENTER")
-                    mrow.vs:SetTextColor(0.4, 0.4, 0.4)
+                    mrow.vs:SetTextColor(C.textMuted[1], C.textMuted[2], C.textMuted[3])
 
-                    mrow.enemy = mrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                    mrow.enemy = mrow:CreateFontString(nil, "OVERLAY")
+                    mrow.enemy:SetFont(lib.FONT_BODY, 10, "")
                     mrow.enemy:SetPoint("LEFT", 305, 0)
                     mrow.enemy:SetWidth(210)
                     mrow.enemy:SetJustifyH("LEFT")
@@ -2385,27 +2525,35 @@ function RefreshSessions()
                     mrow.enemy:SetNonSpaceWrap(false)
                     mrow.enemy:SetWordWrap(true)
 
-                    mrow.rating = mrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                    mrow.rating = mrow:CreateFontString(nil, "OVERLAY")
+                    mrow.rating:SetFont(lib.FONT_BODY, 10, "")
                     mrow.rating:SetPoint("LEFT", 520, 0)
                     mrow.rating:SetWidth(95)
                     mrow.rating:SetJustifyH("CENTER")
 
-                    mrow.duration = mrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                    mrow.duration = mrow:CreateFontString(nil, "OVERLAY")
+                    mrow.duration:SetFont(lib.FONT_BODY, 10, "")
                     mrow.duration:SetPoint("LEFT", 620, 0)
                     mrow.duration:SetWidth(45)
                     mrow.duration:SetJustifyH("CENTER")
 
-                    mrow.timeStr = mrow:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                    mrow.timeStr = mrow:CreateFontString(nil, "OVERLAY")
+                    mrow.timeStr:SetFont(lib.FONT_BODY, 10, "")
                     mrow.timeStr:SetPoint("LEFT", 670, 0)
                     mrow.timeStr:SetWidth(60)
                     mrow.timeStr:SetJustifyH("RIGHT")
 
                     mrow.bg = mrow:CreateTexture(nil, "BACKGROUND")
                     mrow.bg:SetAllPoints()
+
+                    -- Hover highlight
+                    local hl = mrow:CreateTexture(nil, "HIGHLIGHT")
+                    hl:SetAllPoints()
+                    hl:SetColorTexture(C.rowHover[1], C.rowHover[2], C.rowHover[3], C.rowHover[4])
                 end
 
                 mrow:SetPoint("TOPLEFT", 0, -totalHeight)
-                mrow.bg:SetColorTexture(0.08, 0.08, 0.12, 0.8)
+                mrow.bg:SetColorTexture(C.sidebarBg[1], C.sidebarBg[2], C.sidebarBg[3], 0.7)
 
                 -- Result
                 if game.result == "WIN" then
@@ -2442,11 +2590,11 @@ function RefreshSessions()
                 -- Duration
                 local dur = (game.startTime and game.endTime) and (game.endTime - game.startTime) or nil
                 mrow.duration:SetText(FormatDuration(dur))
-                mrow.duration:SetTextColor(0.8, 0.8, 0.8)
+                mrow.duration:SetTextColor(C.textNormal[1], C.textNormal[2], C.textNormal[3])
 
                 -- Time
                 mrow.timeStr:SetText(FormatTime(game.startTime))
-                mrow.timeStr:SetTextColor(0.6, 0.6, 0.6)
+                mrow.timeStr:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
 
                 mrow:Show()
                 totalHeight = totalHeight + ROW_HEIGHT
@@ -2466,8 +2614,229 @@ function RefreshSessions()
         local color = totalNetRating >= 0 and "|cff00ff00" or "|cffff0000"
         ratingStr = " | Net: " .. color .. sign .. totalNetRating .. "|r"
     end
-    historyFrame.title:SetText("Trinketed — " .. countStr .. " (" ..
+    historyFrame.title:SetText(BRANDED_TITLE .. " — " .. countStr .. " (" ..
         "|cff00ff00" .. totalWins .. "W|r / |cffff0000" .. totalLosses .. "L|r)" .. ratingStr)
+end
+
+---------------------------------------------------------------------------
+-- Teams Tab Content
+---------------------------------------------------------------------------
+local teamFilters = {
+    bracket = "All",
+}
+
+local teamBracketDD = CreateSearchableDropdown(teamsContainer, "TkTeamBracketDD", 120, {
+    defaultLabel = "Bracket: All",
+    getOptions = function()
+        local out = {}
+        local brackets = { "2v2", "3v3", "5v5" }
+        for _, b in ipairs(brackets) do
+            table.insert(out, {
+                key = b,
+                text = b,
+                searchText = b:lower(),
+                isChecked = function() return teamFilters.bracket == b end,
+            })
+        end
+        return out
+    end,
+    onToggle = function(key)
+        if teamFilters.bracket == key then
+            teamFilters.bracket = "All"
+        else
+            teamFilters.bracket = key
+        end
+        if RefreshTeams then RefreshTeams() end
+    end,
+    onClear = function()
+        teamFilters.bracket = "All"
+        if RefreshTeams then RefreshTeams() end
+    end,
+    getLabel = function()
+        if teamFilters.bracket == "All" then return "Bracket: All" end
+        return "Bracket: " .. teamFilters.bracket
+    end,
+})
+teamBracketDD.frame:SetPoint("TOPLEFT", 10, -10)
+
+-- Teams column headers
+local teamHeaderY = -46
+local teamHeaders = {
+    { text = "#",        x = 4,   w = 24,  justify = "RIGHT" },
+    { text = "Partners", x = 32,  w = 240, justify = "LEFT" },
+    { text = "Bracket",  x = 276, w = 50,  justify = "CENTER" },
+    { text = "Games",    x = 330, w = 50,  justify = "CENTER" },
+    { text = "W-L",      x = 384, w = 60,  justify = "CENTER" },
+    { text = "Win%",     x = 448, w = 50,  justify = "CENTER" },
+    { text = "Net",      x = 502, w = 60,  justify = "CENTER" },
+}
+for _, h in ipairs(teamHeaders) do
+    local fs = teamsContainer:CreateFontString(nil, "OVERLAY")
+    fs:SetFont(lib.FONT_BODY, 10, "")
+    fs:SetPoint("TOPLEFT", h.x, teamHeaderY)
+    fs:SetWidth(h.w)
+    fs:SetJustifyH(h.justify)
+    fs:SetWordWrap(false)
+    fs:SetText(h.text)
+    fs:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
+end
+
+-- Thin separator below team headers
+local teamHeaderSep = teamsContainer:CreateTexture(nil, "ARTWORK")
+teamHeaderSep:SetHeight(1)
+teamHeaderSep:SetPoint("TOPLEFT", 4, teamHeaderY - 12)
+teamHeaderSep:SetPoint("TOPRIGHT", -16, teamHeaderY - 12)
+teamHeaderSep:SetColorTexture(C.divider[1], C.divider[2], C.divider[3], C.divider[4])
+
+-- Teams scroll frame
+local teamScrollFrame = CreateFrame("ScrollFrame", nil, teamsContainer, "UIPanelScrollFrameTemplate")
+teamScrollFrame:SetPoint("TOPLEFT", 10, teamHeaderY - 14)
+teamScrollFrame:SetPoint("BOTTOMRIGHT", -30, 10)
+
+local teamContent = CreateFrame("Frame", nil, teamScrollFrame)
+teamContent:SetSize(740, 1)
+teamScrollFrame:SetScrollChild(teamContent)
+
+local TEAM_ROW_HEIGHT = 28
+local teamRowPool = {}
+
+---------------------------------------------------------------------------
+-- RefreshTeams
+---------------------------------------------------------------------------
+function RefreshTeams()
+    for _, row in ipairs(teamRowPool) do
+        row:Hide()
+    end
+
+    local allGames = TrinketedHistoryDB and TrinketedHistoryDB.games or {}
+    local bracketFilter = teamFilters.bracket ~= "All" and teamFilters.bracket or nil
+    local teams = ComputeTeams(allGames, bracketFilter)
+
+    local totalHeight = 0
+
+    for i, t in ipairs(teams) do
+        local row = teamRowPool[i]
+        if not row then
+            row = CreateFrame("Frame", nil, teamContent)
+            row:SetSize(740, TEAM_ROW_HEIGHT)
+            teamRowPool[i] = row
+
+            row.index = row:CreateFontString(nil, "OVERLAY")
+            row.index:SetFont(lib.FONT_BODY, 10, "")
+            row.index:SetPoint("LEFT", 4, 0)
+            row.index:SetWidth(24)
+            row.index:SetJustifyH("RIGHT")
+
+            row.partners = row:CreateFontString(nil, "OVERLAY")
+            row.partners:SetFont(lib.FONT_BODY, 10, "")
+            row.partners:SetPoint("LEFT", 32, 0)
+            row.partners:SetWidth(240)
+            row.partners:SetJustifyH("LEFT")
+            row.partners:SetWordWrap(false)
+
+            row.bracket = row:CreateFontString(nil, "OVERLAY")
+            row.bracket:SetFont(lib.FONT_BODY, 10, "")
+            row.bracket:SetPoint("LEFT", 276, 0)
+            row.bracket:SetWidth(50)
+            row.bracket:SetJustifyH("CENTER")
+
+            row.games = row:CreateFontString(nil, "OVERLAY")
+            row.games:SetFont(lib.FONT_BODY, 10, "")
+            row.games:SetPoint("LEFT", 330, 0)
+            row.games:SetWidth(50)
+            row.games:SetJustifyH("CENTER")
+
+            row.wl = row:CreateFontString(nil, "OVERLAY")
+            row.wl:SetFont(lib.FONT_BODY, 10, "")
+            row.wl:SetPoint("LEFT", 384, 0)
+            row.wl:SetWidth(60)
+            row.wl:SetJustifyH("CENTER")
+
+            row.winPct = row:CreateFontString(nil, "OVERLAY")
+            row.winPct:SetFont(lib.FONT_BODY, 10, "")
+            row.winPct:SetPoint("LEFT", 448, 0)
+            row.winPct:SetWidth(50)
+            row.winPct:SetJustifyH("CENTER")
+
+            row.net = row:CreateFontString(nil, "OVERLAY")
+            row.net:SetFont(lib.FONT_BODY, 10, "")
+            row.net:SetPoint("LEFT", 502, 0)
+            row.net:SetWidth(60)
+            row.net:SetJustifyH("CENTER")
+
+            row.bg = row:CreateTexture(nil, "BACKGROUND")
+            row.bg:SetAllPoints()
+
+            local hl = row:CreateTexture(nil, "HIGHLIGHT")
+            hl:SetAllPoints()
+            hl:SetColorTexture(C.rowHover[1], C.rowHover[2], C.rowHover[3], C.rowHover[4])
+        end
+
+        row:SetPoint("TOPLEFT", 0, -totalHeight)
+
+        -- Alternating row color
+        if i % 2 == 0 then
+            row.bg:SetColorTexture(C.rowHover[1], C.rowHover[2], C.rowHover[3], C.rowHover[4])
+        else
+            row.bg:SetColorTexture(0, 0, 0, 0)
+        end
+
+        row.index:SetText("#" .. i)
+        row.index:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
+
+        -- Partners: class-colored names
+        if t.partners and #t.partners > 0 then
+            local pParts = {}
+            for _, p in ipairs(t.partners) do
+                local color = CLASS_COLORS[p.class] or "ffffffff"
+                table.insert(pParts, "|c" .. color .. p.name .. "|r")
+            end
+            row.partners:SetText(table.concat(pParts, ", "))
+        else
+            row.partners:SetText("|cff888888Solo|r")
+        end
+
+        row.bracket:SetText(t.bracket or "?")
+        row.bracket:SetTextColor(C.textBright[1], C.textBright[2], C.textBright[3])
+
+        row.games:SetText(t.totalGames)
+        row.games:SetTextColor(C.textBright[1], C.textBright[2], C.textBright[3])
+
+        row.wl:SetText("|cff00ff00" .. t.wins .. "|r-|cffff0000" .. t.losses .. "|r")
+
+        -- Win% with color gradient
+        local totalTGames = t.wins + t.losses
+        local pct = (totalTGames > 0) and (t.wins / totalTGames * 100) or 0
+        local pr, pg
+        if pct <= 50 then
+            pr = 1
+            pg = pct / 50
+        else
+            pr = 1 - (pct - 50) / 50
+            pg = 1
+        end
+        local pctHex = string.format("|cff%02x%02x00%d%%|r",
+            math.floor(pr * 255 + 0.5), math.floor(pg * 255 + 0.5), math.floor(pct + 0.5))
+        row.winPct:SetText(pctHex)
+
+        -- Net rating
+        if t.netRating and t.netRating ~= 0 then
+            local sign = t.netRating >= 0 and "+" or ""
+            local netColor = t.netRating >= 0 and "|cff00ff00" or "|cffff0000"
+            row.net:SetText(netColor .. sign .. t.netRating .. "|r")
+        else
+            row.net:SetText("|cff888888" .. "0" .. "|r")
+        end
+
+        row:Show()
+        totalHeight = totalHeight + TEAM_ROW_HEIGHT
+    end
+
+    teamContent:SetHeight(math.max(totalHeight, 1))
+
+    -- Update title
+    local count = #teams
+    historyFrame.title:SetText(BRANDED_TITLE .. " — " .. count .. " team" .. (count ~= 1 and "s" or ""))
 end
 
 local function ToggleHistory()
@@ -2476,6 +2845,8 @@ local function ToggleHistory()
     else
         if activeTab == "sessions" then
             RefreshSessions()
+        elseif activeTab == "teams" then
+            RefreshTeams()
         else
             RefreshHistory()
         end
@@ -2748,8 +3119,6 @@ end
 local exportFrame, importFrame  -- forward declarations
 
 ShowExportDialog = function()
-    if exportFrame then exportFrame:Hide() end
-
     local str, err = ExportHistory()
     if not str then
         print("|cff00ccff" .. DISPLAY_NAME .. ":|r " .. (err or "Export failed."))
@@ -2757,127 +3126,124 @@ ShowExportDialog = function()
     end
 
     local count = #TrinketedHistoryDB.games
-    local f = CreateFrame("Frame", "TrinketedExportFrame", UIParent, "BasicFrameTemplateWithInset")
-    f:SetSize(520, 320)
-    f:SetPoint("CENTER")
-    f:SetFrameStrata("DIALOG")
-    f:SetMovable(true)
-    f:EnableMouse(true)
-    f:RegisterForDrag("LeftButton")
-    f:SetScript("OnDragStart", f.StartMoving)
-    f:SetScript("OnDragStop", f.StopMovingOrSizing)
 
-    f.title = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    f.title:SetPoint("TOP", 0, -5)
-    f.title:SetText("Trinketed Export — " .. count .. " games (" .. #str .. " chars)")
+    if not exportFrame then
+        local f = lib:CreateWindowFrame("TrinketedExportFrame", {
+            width = 520, height = 320,
+            title = "",
+            noSpecialFrames = true,
+        })
 
-    local scrollFrame = CreateFrame("ScrollFrame", nil, f, "UIPanelScrollFrameTemplate")
-    scrollFrame:SetPoint("TOPLEFT", 12, -30)
-    scrollFrame:SetPoint("BOTTOMRIGHT", -30, 40)
+        local scrollFrame = CreateFrame("ScrollFrame", nil, f, "UIPanelScrollFrameTemplate")
+        scrollFrame:SetPoint("TOPLEFT", 12, -34)
+        scrollFrame:SetPoint("BOTTOMRIGHT", -30, 40)
 
-    local editBox = CreateFrame("EditBox", nil, scrollFrame)
-    editBox:SetMultiLine(true)
-    editBox:SetFontObject(ChatFontNormal)
-    editBox:SetWidth(460)
-    editBox:SetMaxLetters(0)  -- unlimited
-    editBox:SetAutoFocus(false)
-    editBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
-    scrollFrame:SetScrollChild(editBox)
+        local editBox = CreateFrame("EditBox", nil, scrollFrame)
+        editBox:SetMultiLine(true)
+        editBox:SetFont(lib.FONT_MONO, 10, "")
+        editBox:SetTextColor(C.textNormal[1], C.textNormal[2], C.textNormal[3])
+        editBox:SetWidth(460)
+        editBox:SetMaxLetters(0)  -- unlimited
+        editBox:SetAutoFocus(false)
+        editBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+        scrollFrame:SetScrollChild(editBox)
 
-    editBox:SetText(str)
-    editBox:HighlightText()
-    editBox:SetFocus()
+        -- Select-all on focus so Ctrl+C copies everything
+        editBox:SetScript("OnEditFocusGained", function(self)
+            self:HighlightText()
+        end)
 
-    -- Select-all on focus so Ctrl+C copies everything
-    editBox:SetScript("OnEditFocusGained", function(self)
-        self:HighlightText()
-    end)
-    -- Prevent typing into the export box
-    editBox:SetScript("OnChar", function(self) self:SetText(str); self:HighlightText() end)
+        local hint = f:CreateFontString(nil, "OVERLAY")
+        hint:SetFont(lib.FONT_BODY, 10, "")
+        hint:SetPoint("BOTTOM", 0, 14)
+        hint:SetText("Ctrl+A to select all, Ctrl+C to copy")
+        hint:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
 
-    -- Hint text
-    local hint = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    hint:SetPoint("BOTTOM", 0, 14)
-    hint:SetText("|cff999999Ctrl+A to select all, Ctrl+C to copy|r")
+        f.editBox = editBox
+        exportFrame = f
+    end
 
-    f:SetScript("OnHide", function(self) self:SetParent(nil) end)
-    exportFrame = f
+    -- Update title and content each time
+    exportFrame.titleText:SetText("|cffE8B923T|r|cffF4F4F5RINKETED|r  Export — " .. count .. " games (" .. #str .. " chars)")
+    exportFrame.editBox:SetText(str)
+    exportFrame.editBox:HighlightText()
+    exportFrame.editBox:SetFocus()
+    -- Prevent typing into the export box (closure over current str)
+    exportFrame.editBox:SetScript("OnChar", function(self) self:SetText(str); self:HighlightText() end)
+    exportFrame:Show()
 end
 
 ShowImportDialog = function()
-    if importFrame then importFrame:Hide() end
+    if not importFrame then
+        local f = lib:CreateWindowFrame("TrinketedImportFrame", {
+            width = 520, height = 320,
+            title = "|cffE8B923T|r|cffF4F4F5RINKETED|r  Import — Paste string below",
+            noSpecialFrames = true,
+        })
 
-    local f = CreateFrame("Frame", "TrinketedImportFrame", UIParent, "BasicFrameTemplateWithInset")
-    f:SetSize(520, 320)
-    f:SetPoint("CENTER")
-    f:SetFrameStrata("DIALOG")
-    f:SetMovable(true)
-    f:EnableMouse(true)
-    f:RegisterForDrag("LeftButton")
-    f:SetScript("OnDragStart", f.StartMoving)
-    f:SetScript("OnDragStop", f.StopMovingOrSizing)
+        local scrollFrame = CreateFrame("ScrollFrame", nil, f, "UIPanelScrollFrameTemplate")
+        scrollFrame:SetPoint("TOPLEFT", 12, -34)
+        scrollFrame:SetPoint("BOTTOMRIGHT", -30, 70)
 
-    f.title = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    f.title:SetPoint("TOP", 0, -5)
-    f.title:SetText("Trinketed Import — Paste string below")
+        local editBox = CreateFrame("EditBox", nil, scrollFrame)
+        editBox:SetMultiLine(true)
+        editBox:SetFont(lib.FONT_MONO, 10, "")
+        editBox:SetTextColor(C.textNormal[1], C.textNormal[2], C.textNormal[3])
+        editBox:SetWidth(460)
+        editBox:SetMaxLetters(0)  -- unlimited
+        editBox:SetAutoFocus(true)
+        editBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+        scrollFrame:SetScrollChild(editBox)
 
-    local scrollFrame = CreateFrame("ScrollFrame", nil, f, "UIPanelScrollFrameTemplate")
-    scrollFrame:SetPoint("TOPLEFT", 12, -30)
-    scrollFrame:SetPoint("BOTTOMRIGHT", -30, 70)
-
-    local editBox = CreateFrame("EditBox", nil, scrollFrame)
-    editBox:SetMultiLine(true)
-    editBox:SetFontObject(ChatFontNormal)
-    editBox:SetWidth(460)
-    editBox:SetMaxLetters(0)  -- unlimited
-    editBox:SetAutoFocus(true)
-    editBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
-    scrollFrame:SetScrollChild(editBox)
-
-    -- Import button
-    local btn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    btn:SetSize(120, 26)
-    btn:SetPoint("BOTTOM", 0, 14)
-    btn:SetText("Import")
-    btn:SetScript("OnClick", function()
-        local raw = editBox:GetText():trim()
-        local data, err = ImportHistory(raw)
-        if not data then
-            print("|cff00ccff" .. DISPLAY_NAME .. ":|r |cffff4444Import error:|r " .. (err or "Unknown error"))
-            return
-        end
-        -- Merge games
-        TrinketedHistoryDB = TrinketedHistoryDB or { games = {} }
-        TrinketedHistoryDB.games = TrinketedHistoryDB.games or {}
-        local existing = {}
-        for _, g in ipairs(TrinketedHistoryDB.games) do
-            existing[tostring(g.startTime) .. (g.result or "")] = true
-        end
-        local added = 0
-        for _, g in ipairs(data.g) do
-            local key = tostring(g.startTime) .. (g.result or "")
-            if not existing[key] then
-                table.insert(TrinketedHistoryDB.games, g)
-                added = added + 1
-                existing[key] = true
+        -- Import button
+        lib:CreateButton(f, 200, -282, 120, "Import", function()
+            local raw = editBox:GetText():trim()
+            local data, err = ImportHistory(raw)
+            if not data then
+                print("|cff00ccff" .. DISPLAY_NAME .. ":|r |cffff4444Import error:|r " .. (err or "Unknown error"))
+                return
             end
-        end
-        -- Sort by startTime
-        table.sort(TrinketedHistoryDB.games, function(a, b) return (a.startTime or 0) < (b.startTime or 0) end)
-        print("|cff00ccff" .. DISPLAY_NAME .. ":|r Imported " .. added .. " new games (" .. #data.g .. " total in string, " .. (#data.g - added) .. " duplicates skipped).")
-        if historyFrame and historyFrame:IsShown() then
-            if activeTab == "sessions" then RefreshSessions() else RefreshHistory() end
-        end
-        f:Hide()
-    end)
+            -- Merge games
+            TrinketedHistoryDB = TrinketedHistoryDB or { games = {} }
+            TrinketedHistoryDB.games = TrinketedHistoryDB.games or {}
+            local existing = {}
+            for _, g in ipairs(TrinketedHistoryDB.games) do
+                existing[tostring(g.startTime) .. (g.result or "")] = true
+            end
+            local added = 0
+            for _, g in ipairs(data.g) do
+                local key = tostring(g.startTime) .. (g.result or "")
+                if not existing[key] then
+                    table.insert(TrinketedHistoryDB.games, g)
+                    added = added + 1
+                    existing[key] = true
+                end
+            end
+            -- Sort by startTime
+            table.sort(TrinketedHistoryDB.games, function(a, b) return (a.startTime or 0) < (b.startTime or 0) end)
+            print("|cff00ccff" .. DISPLAY_NAME .. ":|r Imported " .. added .. " new games (" .. #data.g .. " total in string, " .. (#data.g - added) .. " duplicates skipped).")
+            if historyFrame and historyFrame:IsShown() then
+                if activeTab == "sessions" then RefreshSessions()
+                elseif activeTab == "teams" then RefreshTeams()
+                else RefreshHistory() end
+            end
+            f:Hide()
+        end)
 
-    -- Hint text
-    local hint = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    hint:SetPoint("BOTTOM", 0, 44)
-    hint:SetText("|cff999999Ctrl+V to paste, then click Import|r")
+        local hint = f:CreateFontString(nil, "OVERLAY")
+        hint:SetFont(lib.FONT_BODY, 10, "")
+        hint:SetPoint("BOTTOM", 0, 44)
+        hint:SetText("Ctrl+V to paste, then click Import")
+        hint:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
 
-    f:SetScript("OnHide", function(self) self:SetParent(nil) end)
-    importFrame = f
+        f.editBox = editBox
+        importFrame = f
+    end
+
+    -- Clear and show fresh each time
+    importFrame.editBox:SetText("")
+    importFrame.editBox:SetFocus()
+    importFrame:Show()
 end
 
 ---------------------------------------------------------------------------
@@ -3135,7 +3501,9 @@ local function RegisterSubCommands()
             local old = TrinketedHistoryDB and #TrinketedHistoryDB.games or 0
             TrinketedHistoryDB.games = {}
             if historyFrame:IsShown() then
-                if activeTab == "sessions" then RefreshSessions() else RefreshHistory() end
+                if activeTab == "sessions" then RefreshSessions()
+                elseif activeTab == "teams" then RefreshTeams()
+                else RefreshHistory() end
             end
             print("|cff00ccff" .. DISPLAY_NAME .. ":|r Cleared " .. old .. " games.")
         else
