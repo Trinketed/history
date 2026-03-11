@@ -262,6 +262,11 @@ end)
 -- Visible when: in queue, waiting for confirm, or in arena prep room.
 -- Hidden when: game is active, or not queued at all.
 UpdateOverlayVisibility = function()
+    -- Hide if user disabled the overlay
+    if not TrinketedHistoryDB.settings or not TrinketedHistoryDB.settings.showTimestamp then
+        overlay:Hide()
+        return
+    end
     -- Always hide during active game
     if gameStarted then
         overlay:Hide()
@@ -2896,6 +2901,7 @@ frame:SetScript("OnEvent", function(self, event, ...)
             TrinketedHistoryDB = TrinketedHistoryDB or { games = {} }
             TrinketedHistoryDB.games = TrinketedHistoryDB.games or {}
             TrinketedHistoryDB.minimap = TrinketedHistoryDB.minimap or { minimapPos = 220, hide = false }
+            TrinketedHistoryDB.settings = TrinketedHistoryDB.settings or { showTimestamp = true }
 
             -- Migrate data from old TrinketedDB.games if TrinketedHistoryDB is empty
             if #TrinketedHistoryDB.games == 0 and TrinketedDB and TrinketedDB.games and #TrinketedDB.games > 0 then
@@ -3299,8 +3305,18 @@ lib:RegisterSubAddon("History", {
         info:SetText("Arena match history and VOD timestamp overlay.\n\nUse |cffE8B923/trinketed history|r to open the history window.")
 
         lib:CreateButton(contentFrame, 20, -70, 180, "Open History Window", function()
+            lib:HideOptionsPanel()
             ToggleHistory()
         end)
+
+        local y = -120
+        y = lib:CreateSectionHeader(contentFrame, y, "TIMESTAMP OVERLAY")
+
+        lib:CreateCheckbox(contentFrame, 20, y, "Show timestamp when in queue",
+            TrinketedHistoryDB.settings.showTimestamp, function(isOn)
+                TrinketedHistoryDB.settings.showTimestamp = isOn
+                UpdateOverlayVisibility()
+            end)
     end,
 })
 
