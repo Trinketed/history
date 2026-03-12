@@ -324,6 +324,82 @@ local function SnapshotAllRatings()
     return ratings
 end
 
+local MAX_LOG_EVENTS = 30000
+
+local function InitGameLog()
+    if not TrinketedHistoryDB.settings.enableGameLog then return end
+    if not currentGame then return end
+
+    -- Build initial state snapshot from visible units
+    local players = {}
+    local units = { "player" }
+    for i = 1, 4 do units[#units + 1] = "party" .. i end
+    for i = 1, 5 do units[#units + 1] = "arena" .. i end
+
+    for _, unit in ipairs(units) do
+        local guid = UnitGUID(unit)
+        if guid and not players[guid] then
+            local name = StripRealm(UnitName(unit))
+            local _, className = UnitClass(unit)
+            local team
+            if UnitIsUnit(unit, "player") or unit:match("^party") then
+                team = "friendly"
+            else
+                team = "enemy"
+            end
+            players[guid] = {
+                name = name,
+                class = FormatClassName(className),
+                team = team,
+                health = UnitHealth(unit),
+                healthMax = UnitHealthMax(unit),
+                power = UnitPower(unit),
+                powerMax = UnitPowerMax(unit),
+                powerType = UnitPowerType(unit),
+            }
+        end
+    end
+
+    local epochTs = math.floor((tsBaseEpoch + (GetTime() - tsBaseGetTime)) * 1000 + 0.5) / 1000
+    currentGame.gameLog = {
+        events = {},
+        initialState = { players = players, timestamp = epochTs },
+    }
+    dbg("InitGameLog(): captured", #units, "unit slots, snapshot ts:", epochTs)
+end
+
+local CLEU_NIL = "\0"  -- sentinel for nil values in CLEU arrays (preserved through JSON)
+
+local function RecordCLEUEvent()
+    if not currentGame or not currentGame.gameLog then return end
+    local events = currentGame.gameLog.events
+    if #events >= MAX_LOG_EVENTS then return end
+
+    -- Capture all args; replace nils with sentinel so JSON serialization
+    -- doesn't lose data (Lua's # operator stops at first nil gap)
+    local function packCLEU(...)
+        local n = select("#", ...)
+        local t = {}
+        for i = 1, n do
+            local v = select(i, ...)
+            t[i] = (v == nil) and CLEU_NIL or v
+        end
+        return t
+    end
+    local info = packCLEU(CombatLogGetCurrentEventInfo())
+
+    -- Replace CLEU timestamp with epoch+ms
+    local cleuTs = info[1]
+    if cleuTs > 1000000000 then
+        info[1] = math.floor(cleuTs * 1000 + 0.5) / 1000
+    else
+        info[1] = math.floor((tsBaseEpoch + (cleuTs - tsBaseGetTime)) * 1000 + 0.5) / 1000
+    end
+    events[#events + 1] = info
+end
+
+local CompressGameLog  -- forward declaration; body defined after TableToJSON/LibDeflate
+
 local function ResetGameState()
     dbg("ResetGameState()")
     gameStarted = false
@@ -348,6 +424,7 @@ local function ResetGameState()
         ratingBefore = nil,
         ratingAfter = nil,
         ratingChange = nil,
+        gameLog = nil,
     }
 end
 
@@ -432,6 +509,8 @@ local function SaveGame(result)
     dbg("  startTime:", currentGame.startTime, "endTime:", currentGame.endTime)
     dbg("  enemyComp:", table.concat(currentGame.enemyComp, ", "))
 
+    local compressedLog = CompressGameLog()
+
     table.insert(TrinketedHistoryDB.games, {
         startTime = currentGame.startTime,
         endTime = currentGame.endTime,
@@ -445,6 +524,7 @@ local function SaveGame(result)
         ratingBefore = currentGame.ratingBefore,
         ratingAfter = currentGame.ratingAfter,
         ratingChange = currentGame.ratingChange,
+        gameLog = compressedLog,
     })
 
     -- Flush combat log between games
@@ -1956,6 +2036,21 @@ function RefreshHistory()
             row.timeStr:SetWidth(60)
             row.timeStr:SetJustifyH("RIGHT")
 
+            row.replayBtn = CreateFrame("Button", nil, row)
+            row.replayBtn:SetSize(16, 16)
+            row.replayBtn:SetPoint("RIGHT", -4, 0)
+            row.replayBtn.icon = row.replayBtn:CreateFontString(nil, "OVERLAY")
+            row.replayBtn.icon:SetFont(lib.FONT_MONO, 10, "")
+            row.replayBtn.icon:SetPoint("CENTER")
+            row.replayBtn.icon:SetText(">")
+            row.replayBtn.icon:SetTextColor(C.accent[1], C.accent[2], C.accent[3])
+            row.replayBtn:SetScript("OnEnter", function(self)
+                lib:ShowMicroTip(self, "Open replay", "TOP", 0, 4)
+            end)
+            row.replayBtn:SetScript("OnLeave", function()
+                lib:HideMicroTip()
+            end)
+
             -- Alternating background
             row.bg = row:CreateTexture(nil, "BACKGROUND")
             row.bg:SetAllPoints()
@@ -2016,6 +2111,16 @@ function RefreshHistory()
 
         row.timeStr:SetText(FormatTime(game.startTime))
         row.timeStr:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
+
+        -- Replay button
+        if game.gameLog then
+            row.replayBtn:Show()
+            row.replayBtn:SetScript("OnClick", function()
+                addon:OpenReplay(game)
+            end)
+        else
+            row.replayBtn:Hide()
+        end
 
         row:Show()
         totalHeight = totalHeight + ROW_HEIGHT
@@ -2996,6 +3101,30 @@ local function TableToJSON(val)
     return "null"
 end
 
+function CompressGameLog()
+    if not currentGame or not currentGame.gameLog then return nil end
+    local log = currentGame.gameLog
+    local container = {
+        v = 1,
+        initialState = log.initialState,
+        events = log.events,
+        eventCount = #log.events,
+    }
+    local json = TableToJSON(container)
+    local compressed = LibDeflate:CompressZlib(json, { level = 9 })
+    if not compressed then
+        dbg("CompressGameLog: compression failed")
+        return nil
+    end
+    local encoded = LibDeflate:EncodeForPrint(compressed)
+    if not encoded then
+        dbg("CompressGameLog: encoding failed")
+        return nil
+    end
+    dbg("CompressGameLog:", #log.events, "events,", #json, "bytes JSON →", #encoded, "bytes encoded")
+    return encoded
+end
+
 -- Minimal JSON parser (for import)
 local function JSONToTable(str)
     local pos = 1
@@ -3079,6 +3208,7 @@ local function JSONToTable(str)
     end
     return parseValue()
 end
+addon.JSONToTable = JSONToTable
 
 local EXPORT_HEADER = "!TK:1!"
 
@@ -3086,7 +3216,18 @@ local function ExportHistory()
     if not TrinketedHistoryDB or not TrinketedHistoryDB.games or #TrinketedHistoryDB.games == 0 then
         return nil, "No games to export."
     end
-    local data = { v = 1, t = time(), g = TrinketedHistoryDB.games }
+    -- Strip gameLog from exported games to keep exports lightweight
+    local strippedGames = {}
+    for i, game in ipairs(TrinketedHistoryDB.games) do
+        local copy = {}
+        for k, v in pairs(game) do
+            if k ~= "gameLog" then
+                copy[k] = v
+            end
+        end
+        strippedGames[i] = copy
+    end
+    local data = { v = 1, t = time(), g = strippedGames }
     local json = TableToJSON(data)
     local compressed = LibDeflate:CompressZlib(json, { level = 9 })
     if not compressed then return nil, "Compression failed." end
@@ -3268,6 +3409,9 @@ frame:SetScript("OnEvent", function(self, event, ...)
             TrinketedHistoryDB.games = TrinketedHistoryDB.games or {}
             TrinketedHistoryDB.minimap = TrinketedHistoryDB.minimap or { minimapPos = 220, hide = false }
             TrinketedHistoryDB.settings = TrinketedHistoryDB.settings or { showTimestamp = true }
+            if TrinketedHistoryDB.settings.enableGameLog == nil then
+                TrinketedHistoryDB.settings.enableGameLog = false
+            end
 
             -- Migrate data from old TrinketedDB.games if TrinketedHistoryDB is empty
             if #TrinketedHistoryDB.games == 0 and TrinketedDB and TrinketedDB.games and #TrinketedDB.games > 0 then
@@ -3324,6 +3468,7 @@ frame:SetScript("OnEvent", function(self, event, ...)
                 SnapshotEnemyTeam()
                 if gameStarted then
                     StartSnapshotTicker()
+                    InitGameLog()
                 end
             end
         end
@@ -3378,6 +3523,7 @@ frame:SetScript("OnEvent", function(self, event, ...)
             SnapshotFriendlyTeam()
             SnapshotEnemyTeam()
             StartSnapshotTicker()
+            InitGameLog()
             dbg("Game started! startTime:", currentGame.startTime)
             print("|cff00ccff" .. DISPLAY_NAME .. ":|r Gates open — game started.")
         end
@@ -3429,6 +3575,7 @@ frame:SetScript("OnEvent", function(self, event, ...)
 
     elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
         if not inArena or not gameStarted then return end
+        RecordCLEUEvent()
         local _, eventType, _, sourceGUID, _, _, _, destGUID, _, _, _, spellID, spellName = CombatLogGetCurrentEventInfo()
 
         -- Try to discover unknown GUIDs from arena/party units
@@ -3657,6 +3804,183 @@ local function RegisterSubCommands()
             end
         end
     end)
+
+    -- Debug CLEU window: shows live combat log events for the player
+    local cleuFrame = nil
+    lib:RegisterSubCommand("cleu", function()
+        if cleuFrame then
+            if cleuFrame:IsShown() then
+                cleuFrame:Hide()
+            else
+                cleuFrame:Show()
+            end
+            return
+        end
+
+        cleuFrame = CreateFrame("Frame", "TrinketedCLEUDebug", UIParent, "BackdropTemplate")
+        cleuFrame:SetSize(600, 300)
+        cleuFrame:SetPoint("BOTTOMLEFT", 20, 20)
+        cleuFrame:SetBackdrop({
+            bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
+            edgeFile = "Interface\\ChatFrame\\ChatFrameBackground",
+            edgeSize = 1,
+        })
+        cleuFrame:SetBackdropColor(0, 0, 0, 0.85)
+        cleuFrame:SetBackdropBorderColor(C.borderDefault[1], C.borderDefault[2], C.borderDefault[3], 1)
+        cleuFrame:SetMovable(true)
+        cleuFrame:EnableMouse(true)
+        cleuFrame:RegisterForDrag("LeftButton")
+        cleuFrame:SetScript("OnDragStart", cleuFrame.StartMoving)
+        cleuFrame:SetScript("OnDragStop", cleuFrame.StopMovingOrSizing)
+        cleuFrame:SetFrameStrata("HIGH")
+
+        -- Title
+        local title = cleuFrame:CreateFontString(nil, "OVERLAY")
+        title:SetFont(lib.FONT_DISPLAY, 10, "")
+        title:SetPoint("TOPLEFT", 6, -4)
+        title:SetText("|cffE8B923CLEU Debug|r  (your char only)")
+        title:SetTextColor(C.textBright[1], C.textBright[2], C.textBright[3])
+
+        -- Close button
+        local closeBtn = CreateFrame("Button", nil, cleuFrame)
+        closeBtn:SetSize(16, 16)
+        closeBtn:SetPoint("TOPRIGHT", -4, -4)
+        closeBtn.text = closeBtn:CreateFontString(nil, "OVERLAY")
+        closeBtn.text:SetFont(lib.FONT_MONO, 12, "")
+        closeBtn.text:SetPoint("CENTER")
+        closeBtn.text:SetText("x")
+        closeBtn.text:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
+        closeBtn:SetScript("OnClick", function() cleuFrame:Hide() end)
+
+        -- Scroll frame
+        local scroll = CreateFrame("ScrollFrame", nil, cleuFrame, "UIPanelScrollFrameTemplate")
+        scroll:SetPoint("TOPLEFT", 4, -18)
+        scroll:SetPoint("BOTTOMRIGHT", -24, 4)
+
+        local content = CreateFrame("Frame", nil, scroll)
+        content:SetWidth(560)
+        content:SetHeight(1)
+        scroll:SetScrollChild(content)
+        cleuFrame.content = content
+        cleuFrame.lines = {}
+        cleuFrame.lineCount = 0
+        cleuFrame.scroll = scroll
+
+        local MAX_LINES = 200
+        local LINE_H = 12
+
+        local function AddLine(text)
+            cleuFrame.lineCount = cleuFrame.lineCount + 1
+            local idx = cleuFrame.lineCount
+            if idx > MAX_LINES then
+                -- Shift lines up: remove oldest
+                for i = 1, MAX_LINES - 1 do
+                    cleuFrame.lines[i]:SetText(cleuFrame.lines[i + 1]:GetText())
+                end
+                idx = MAX_LINES
+                cleuFrame.lineCount = MAX_LINES
+                cleuFrame.lines[idx]:SetText(text)
+            else
+                local fs = cleuFrame.lines[idx]
+                if not fs then
+                    fs = content:CreateFontString(nil, "OVERLAY")
+                    fs:SetFont(lib.FONT_MONO, 8, "")
+                    fs:SetPoint("TOPLEFT", 2, -((idx - 1) * LINE_H))
+                    fs:SetPoint("RIGHT", -2, 0)
+                    fs:SetJustifyH("LEFT")
+                    cleuFrame.lines[idx] = fs
+                end
+                fs:SetText(text)
+            end
+            content:SetHeight(math.max(1, cleuFrame.lineCount * LINE_H))
+            -- Auto-scroll to bottom
+            C_Timer.After(0, function()
+                if cleuFrame.scroll then
+                    local max = cleuFrame.scroll:GetVerticalScrollRange()
+                    cleuFrame.scroll:SetVerticalScroll(max)
+                end
+            end)
+        end
+        cleuFrame.AddLine = AddLine
+
+        -- Filter toggle: "mine" (default) or "all"
+        cleuFrame.filterMine = true
+        local filterBtn = CreateFrame("Button", nil, cleuFrame)
+        filterBtn:SetSize(60, 14)
+        filterBtn:SetPoint("TOP", 0, -4)
+        filterBtn.text = filterBtn:CreateFontString(nil, "OVERLAY")
+        filterBtn.text:SetFont(lib.FONT_MONO, 8, "")
+        filterBtn.text:SetPoint("CENTER")
+        filterBtn.text:SetText("[mine]")
+        filterBtn.text:SetTextColor(C.accent[1], C.accent[2], C.accent[3])
+        filterBtn:SetScript("OnClick", function()
+            cleuFrame.filterMine = not cleuFrame.filterMine
+            if cleuFrame.filterMine then
+                filterBtn.text:SetText("[mine]")
+                title:SetText("|cffE8B923CLEU Debug|r  (your char only)")
+            else
+                filterBtn.text:SetText("[all]")
+                title:SetText("|cffE8B923CLEU Debug|r  (all events)")
+            end
+        end)
+
+        -- Register for CLEU + UNIT_SPELLCAST_SUCCEEDED
+        cleuFrame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+        cleuFrame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
+        cleuFrame:SetScript("OnEvent", function(_, event, ...)
+            if not cleuFrame:IsShown() then return end
+
+            if event == "UNIT_SPELLCAST_SUCCEEDED" then
+                local unit, castGUID, spellID = ...
+                if unit == "player" or (not cleuFrame.filterMine and unit:match("^party%d$")) then
+                    local spellName = ""
+                    if C_Spell and C_Spell.GetSpellInfo then
+                        local info = C_Spell.GetSpellInfo(spellID)
+                        spellName = info and info.name or ""
+                    elseif GetSpellInfo then
+                        spellName = GetSpellInfo(spellID) or ""
+                    end
+                    AddLine("|cff44ff44UNIT_SPELLCAST|r  " .. tostring(unit) ..
+                        "  |cffcccccc" .. tostring(spellID) .. ", " .. spellName .. "|r")
+                end
+                return
+            end
+
+            local info = { CombatLogGetCurrentEventInfo() }
+            local srcGUID = info[4]
+            local dstGUID = info[8]
+
+            if cleuFrame.filterMine then
+                local myGUID = UnitGUID("player")
+                if srcGUID ~= myGUID and dstGUID ~= myGUID then return end
+            end
+
+            -- Format: subevent | src > dst | params from [12]+
+            local subevent = tostring(info[2] or "?")
+            local srcName = tostring(info[5] or "")
+            local dstName = tostring(info[9] or "")
+            local parts = { "|cff888888" .. subevent .. "|r" }
+            if srcName ~= "" or dstName ~= "" then
+                table.insert(parts, srcName .. ">" .. dstName)
+            end
+            -- Params from [12] onward
+            local extra = {}
+            for i = 12, #info do
+                local v = info[i]
+                if v ~= nil then
+                    table.insert(extra, tostring(v))
+                end
+            end
+            if #extra > 0 then
+                table.insert(parts, "|cffcccccc" .. table.concat(extra, ", ") .. "|r")
+            end
+
+            AddLine(table.concat(parts, "  "))
+        end)
+
+        cleuFrame:Show()
+        print("|cffE8B923Trinketed:|r CLEU debug window opened. Toggle with /trink cleu")
+    end)
 end
 
 ---------------------------------------------------------------------------
@@ -3685,6 +4009,20 @@ lib:RegisterSubAddon("History", {
                 TrinketedHistoryDB.settings.showTimestamp = isOn
                 UpdateOverlayVisibility()
             end)
+
+        y = y - 30
+        y = lib:CreateSectionHeader(contentFrame, y, "GAME LOGGING")
+
+        lib:CreateCheckbox(contentFrame, 20, y, "Record combat events for replay",
+            TrinketedHistoryDB.settings.enableGameLog, function(isOn)
+                TrinketedHistoryDB.settings.enableGameLog = isOn
+            end)
+
+        local note = contentFrame:CreateFontString(nil, "OVERLAY")
+        note:SetFont(lib.FONT_BODY, 11, "")
+        note:SetPoint("TOPLEFT", 44, y - 22)
+        note:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
+        note:SetText("Captures all combat log events during arena matches.\nAdds ~200-400KB per game to saved data.")
     end,
 })
 
