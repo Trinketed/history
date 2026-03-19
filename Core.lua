@@ -3607,6 +3607,38 @@ frame:SetScript("OnEvent", function(self, event, ...)
             AssignSpec(guid, spellName)
         end
 
+        -- Record UNIT_SPELLCAST_SUCCEEDED into gameLog (deduplicate by GUID+spellID)
+        if currentGame and currentGame.gameLog then
+            local events = currentGame.gameLog.events
+            -- Skip duplicate: same GUID+spellID as last USC event
+            local lastEvt = events[#events]
+            if lastEvt and lastEvt[2] == "UNIT_SPELLCAST_SUCCEEDED"
+                and lastEvt[4] == guid and lastEvt[12] == spellID then
+                return
+            end
+            if #events < MAX_LOG_EVENTS then
+                local unitName = StripRealm(UnitName(unit))
+                local epochNow = math.floor((tsBaseEpoch + (GetTime() - tsBaseGetTime)) * 1000 + 0.5) / 1000
+                local srcFlags = UnitIsFriend("player", unit) and 0x511 or 0x548
+                events[#events + 1] = {
+                    epochNow,                       -- [1] timestamp
+                    "UNIT_SPELLCAST_SUCCEEDED",     -- [2] event type
+                    false,                          -- [3] hideCaster
+                    guid,                           -- [4] srcGUID
+                    unitName or "",                 -- [5] srcName
+                    srcFlags,                       -- [6] srcFlags
+                    0,                              -- [7] srcRaidFlags
+                    guid,                           -- [8] destGUID
+                    unitName or "",                 -- [9] destName
+                    srcFlags,                       -- [10] destFlags
+                    0,                              -- [11] destRaidFlags
+                    spellID,                        -- [12] spellId
+                    spellName or "",                -- [13] spellName
+                    0x1,                            -- [14] spellSchool
+                }
+            end
+        end
+
     elseif event == "PVP_RATED_STATS_UPDATE" then
         -- Rating data refreshed — update pre-game snapshot if we haven't captured it yet
         if inArena and currentGame and not currentGame.ratingsBefore then
@@ -3805,6 +3837,149 @@ local function RegisterSubCommands()
         end
     end)
 
+    -- Debug log: records CLEU events for the player outside of arena,
+    -- then compresses and prints the encoded string for testing.
+    local debugLog = nil  -- { events = {}, initialState = {} } when active
+    local debugLogFrame = CreateFrame("Frame")
+
+    lib:RegisterSubCommand("debuglog", function()
+        if debugLog then
+            -- Stop recording, compress, and output
+            debugLogFrame:UnregisterAllEvents()
+            local eventCount = #debugLog.events
+            if eventCount == 0 then
+                print("|cffE8B923Trinketed:|r Debug log stopped — no events captured.")
+                debugLog = nil
+                return
+            end
+            -- Compress using the same pipeline as CompressGameLog
+            local container = {
+                v = 1,
+                initialState = debugLog.initialState,
+                events = debugLog.events,
+                eventCount = eventCount,
+            }
+            local json = TableToJSON(container)
+            local compressed = LibDeflate:CompressZlib(json, { level = 9 })
+            if not compressed then
+                print("|cffE8B923Trinketed:|r Debug log compression failed.")
+                debugLog = nil
+                return
+            end
+            local encoded = LibDeflate:EncodeForPrint(compressed)
+            if not encoded then
+                print("|cffE8B923Trinketed:|r Debug log encoding failed.")
+                debugLog = nil
+                return
+            end
+            print("|cffE8B923Trinketed:|r Debug log stopped. " .. eventCount .. " events, " .. #encoded .. " bytes encoded.")
+            -- Store as a debug game entry so it can be read from SavedVariables
+            local entry = {
+                playerName = UnitName("player"),
+                startTime = math.floor(debugLog.initialState.timestamp),
+                endTime = math.floor((tsBaseEpoch + (GetTime() - tsBaseGetTime)) * 1000 + 0.5) / 1000,
+                result = "WIN",
+                friendlyTeam = {},
+                enemyTeam = {},
+                enemyComp = {},
+                gameLog = encoded,
+            }
+            TrinketedHistoryDB.debugLog = entry
+            print("|cffE8B923Trinketed:|r Saved to TrinketedHistoryDB.debugLog. /reload to flush to disk.")
+            debugLog = nil
+        else
+            -- Start recording
+            local myGUID = UnitGUID("player")
+            local myName = UnitName("player")
+            local _, myClass = UnitClass("player")
+            local epochTs = math.floor((tsBaseEpoch + (GetTime() - tsBaseGetTime)) * 1000 + 0.5) / 1000
+            debugLog = {
+                events = {},
+                initialState = {
+                    timestamp = epochTs,
+                    players = {
+                        [myGUID] = {
+                            name = myName,
+                            class = FormatClassName(myClass),
+                            team = "friendly",
+                            health = UnitHealth("player"),
+                            healthMax = UnitHealthMax("player"),
+                            power = UnitPower("player"),
+                            powerMax = UnitPowerMax("player"),
+                            powerType = UnitPowerType("player"),
+                        },
+                    },
+                },
+            }
+
+            debugLogFrame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+            debugLogFrame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
+            debugLogFrame:SetScript("OnEvent", function(_, event, ...)
+                if not debugLog then return end
+                if #debugLog.events >= MAX_LOG_EVENTS then return end
+
+                if event == "UNIT_SPELLCAST_SUCCEEDED" then
+                    local unit, castGUID, spellID = ...
+                    if unit ~= "player" then return end
+                    local spellName = ""
+                    if C_Spell and C_Spell.GetSpellInfo then
+                        local info = C_Spell.GetSpellInfo(spellID)
+                        spellName = info and info.name or ""
+                    elseif GetSpellInfo then
+                        spellName = GetSpellInfo(spellID) or ""
+                    end
+                    local epochNow = math.floor((tsBaseEpoch + (GetTime() - tsBaseGetTime)) * 1000 + 0.5) / 1000
+                    -- Pack in same positional format as CLEU events
+                    local info = {
+                        epochNow,                       -- [1] timestamp
+                        "UNIT_SPELLCAST_SUCCEEDED",     -- [2] event type
+                        false,                          -- [3] hideCaster
+                        myGUID,                         -- [4] srcGUID
+                        myName,                         -- [5] srcName
+                        0x511,                          -- [6] srcFlags (friendly player)
+                        0,                              -- [7] srcRaidFlags
+                        myGUID,                         -- [8] destGUID
+                        myName,                         -- [9] destName
+                        0x511,                          -- [10] destFlags
+                        0,                              -- [11] destRaidFlags
+                        spellID,                        -- [12] spellId
+                        spellName,                      -- [13] spellName
+                        0x1,                            -- [14] spellSchool
+                    }
+                    debugLog.events[#debugLog.events + 1] = info
+                    return
+                end
+
+                local function packCLEU(...)
+                    local n = select("#", ...)
+                    local t = {}
+                    for i = 1, n do
+                        local v = select(i, ...)
+                        t[i] = (v == nil) and CLEU_NIL or v
+                    end
+                    return t
+                end
+                local info = packCLEU(CombatLogGetCurrentEventInfo())
+
+                -- Filter to player only
+                local srcGUID = info[4]
+                local dstGUID = info[8]
+                if srcGUID ~= myGUID and dstGUID ~= myGUID then return end
+
+                -- Replace CLEU timestamp with epoch+ms
+                local cleuTs = info[1]
+                if cleuTs > 1000000000 then
+                    info[1] = math.floor(cleuTs * 1000 + 0.5) / 1000
+                else
+                    info[1] = math.floor((tsBaseEpoch + (cleuTs - tsBaseGetTime)) * 1000 + 0.5) / 1000
+                end
+                debugLog.events[#debugLog.events + 1] = info
+            end)
+
+            print("|cffE8B923Trinketed:|r Debug log started. Use your abilities, then run |cffE8B923/trinketed debuglog|r again to stop and encode.")
+        end
+    end)
+
     -- Debug CLEU window: shows live combat log events for the player
     local cleuFrame = nil
     lib:RegisterSubCommand("cleu", function()
@@ -3940,7 +4115,7 @@ local function RegisterSubCommands()
                     elseif GetSpellInfo then
                         spellName = GetSpellInfo(spellID) or ""
                     end
-                    AddLine("|cff44ff44UNIT_SPELLCAST|r  " .. tostring(unit) ..
+                    AddLine("|cff44ff44" .. event .. "|r  " .. tostring(unit) ..
                         "  |cffcccccc" .. tostring(spellID) .. ", " .. spellName .. "|r")
                 end
                 return
