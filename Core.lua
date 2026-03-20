@@ -943,9 +943,15 @@ local function ComputeSessions(games, bracketFilter, daysFilter)
 
         s.wins         = wins
         s.losses       = losses
-        s.ratingChange = totalRatingChange
         s.ratingStart  = s.games[1].ratingBefore
         s.ratingEnd    = s.games[#s.games].ratingAfter
+        -- Prefer direct difference when both endpoints are known;
+        -- fall back to sum of per-game changes otherwise
+        if s.ratingStart and s.ratingEnd then
+            s.ratingChange = s.ratingEnd - s.ratingStart
+        else
+            s.ratingChange = totalRatingChange
+        end
 
         -- Collect unique partners (friendly team members excluding self)
         local seen = {}
@@ -1172,35 +1178,39 @@ local ShowExportDialog
 local ShowImportDialog
 
 ---------------------------------------------------------------------------
--- History Window
+-- History Content (embedded in the options panel)
 ---------------------------------------------------------------------------
-local historyFrame = lib:CreateWindowFrame("TrinketedHistoryFrame", {
-    width = 800, height = 560,
-    title = BRANDED_TITLE,
-})
-historyFrame.title = historyFrame.titleText
+local historyContent = CreateFrame("Frame", "TrinketedHistoryContent", UIParent)
+historyContent:SetSize(1, 1)
+historyContent:Hide()
 
----------------------------------------------------------------------------
--- Tab Bar
----------------------------------------------------------------------------
-local activeTab = "matches" -- "matches", "sessions", or "teams"
+local activeTab = "matches" -- "matches", "sessions", "teams", or "settings"
 
 -- Forward declarations for tab refresh functions
 local RefreshHistory
 local RefreshSessions
 local RefreshTeams
 
--- Tab container anchored below the title divider
-local tabContainer = CreateFrame("Frame", nil, historyFrame)
-tabContainer:SetPoint("TOPLEFT", 6, -30)
-tabContainer:SetPoint("TOPRIGHT", -6, -30)
-tabContainer:SetPoint("BOTTOMLEFT", 6, 6)
-tabContainer:SetPoint("BOTTOMRIGHT", -6, 6)
+-- Refresh the active tab whenever the history content becomes visible
+historyContent:SetScript("OnShow", function()
+    if activeTab == "sessions" then
+        if RefreshSessions then RefreshSessions() end
+    elseif activeTab == "teams" then
+        if RefreshTeams then RefreshTeams() end
+    elseif activeTab == "matches" then
+        if RefreshHistory then RefreshHistory() end
+    end
+end)
+
+-- Tab container fills the content area
+local tabContainer = CreateFrame("Frame", nil, historyContent)
+tabContainer:SetAllPoints()
 
 local historyTabBar = lib:CreateTabBar(tabContainer, {
     { "matches", "Matches" },
     { "sessions", "Sessions" },
     { "teams", "Teams" },
+    { "settings", "Settings" },
 }, {
     height = 26,
     tabWidth = 80,
@@ -1216,9 +1226,12 @@ local historyTabBar = lib:CreateTabBar(tabContainer, {
     end,
 })
 
+
+
 local matchesContainer = historyTabBar.contents["matches"]
 local sessionsContainer = historyTabBar.contents["sessions"]
 local teamsContainer = historyTabBar.contents["teams"]
+local settingsContainer = historyTabBar.contents["settings"]
 
 historyTabBar:SelectTab("matches")
 
@@ -1496,7 +1509,7 @@ local friendlyCompDD = CreateSearchableDropdown(matchesContainer, "TkCompDD", 15
         return "Player Comp: " .. table.concat(t, ", ")
     end,
 })
-friendlyCompDD.frame:SetPoint("TOPLEFT", 12, -48)
+friendlyCompDD.frame:SetPoint("TOPLEFT", 12, -10)
 
 local partnerDD = CreateSearchableDropdown(matchesContainer, "TkPartDD", 155, {
     defaultLabel = "Partner: All",
@@ -1519,7 +1532,7 @@ local partnerDD = CreateSearchableDropdown(matchesContainer, "TkPartDD", 155, {
         return "Partner: " .. table.concat(t, ", ")
     end,
 })
-partnerDD.frame:SetPoint("TOPLEFT", 177, -48)
+partnerDD.frame:SetPoint("TOPLEFT", 177, -10)
 
 local enemyCompDD = CreateSearchableDropdown(matchesContainer, "TkECompDD", 155, {
     defaultLabel = "Enemy Comp: All",
@@ -1542,7 +1555,7 @@ local enemyCompDD = CreateSearchableDropdown(matchesContainer, "TkECompDD", 155,
         return "Enemy Comp: " .. table.concat(t, ", ")
     end,
 })
-enemyCompDD.frame:SetPoint("TOPLEFT", 342, -48)
+enemyCompDD.frame:SetPoint("TOPLEFT", 342, -10)
 
 ---------------------------------------------------------------------------
 -- Filter Row 2: Enemy Players | Enemy Race | Result | Reset
@@ -1568,7 +1581,7 @@ local enemyPlayerDD = CreateSearchableDropdown(matchesContainer, "TkEPlrDD", 155
         return "Enemy Players: " .. table.concat(t, ", ")
     end,
 })
-enemyPlayerDD.frame:SetPoint("TOPLEFT", 12, -74)
+enemyPlayerDD.frame:SetPoint("TOPLEFT", 12, -36)
 
 local enemyRaceDD = CreateSearchableDropdown(matchesContainer, "TkERaceDD", 155, {
     defaultLabel = "Race: All",
@@ -1590,7 +1603,7 @@ local enemyRaceDD = CreateSearchableDropdown(matchesContainer, "TkERaceDD", 155,
         return "Race: " .. table.concat(t, ", ")
     end,
 })
-enemyRaceDD.frame:SetPoint("TOPLEFT", 177, -74)
+enemyRaceDD.frame:SetPoint("TOPLEFT", 177, -36)
 
 local resultDD = CreateSearchableDropdown(matchesContainer, "TkResultDD", 155, {
     defaultLabel = "Result: All",
@@ -1616,12 +1629,12 @@ local resultDD = CreateSearchableDropdown(matchesContainer, "TkResultDD", 155, {
         return "Result: All"
     end,
 })
-resultDD.frame:SetPoint("TOPLEFT", 342, -74)
+resultDD.frame:SetPoint("TOPLEFT", 342, -36)
 
 -- Export and Reset buttons (positioned from the right)
 local resetBtn = CreateFrame("Button", nil, matchesContainer)
 resetBtn:SetSize(60, 24)
-resetBtn:SetPoint("TOPRIGHT", -16, -76)
+resetBtn:SetPoint("TOPRIGHT", -16, -38)
 do
     local bg = resetBtn:CreateTexture(nil, "BACKGROUND")
     bg:SetAllPoints()
@@ -1689,7 +1702,7 @@ resetBtn:SetScript("OnClick", function()
 end)
 
 -- Column headers
-local headerY = -104
+local headerY = -66
 local headers = {
     { text = "#",        x = 4,   w = 24, justify = "RIGHT" },
     { text = "Result",   x = 32,  w = 36, justify = "LEFT" },
@@ -2096,11 +2109,15 @@ function RefreshHistory()
         end
         row.enemy:SetText(enemyStr)
 
-        -- Rating: show change (e.g., "+16")
+        -- Rating: show after rating with change (e.g., "2341 (+16)")
         if game.ratingChange then
             local sign = game.ratingChange >= 0 and "+" or ""
             local color = game.ratingChange >= 0 and "|cff00ff00" or "|cffff0000"
-            row.rating:SetText(color .. sign .. game.ratingChange .. "|r")
+            if game.ratingAfter then
+                row.rating:SetText(color .. game.ratingAfter .. " (" .. sign .. game.ratingChange .. ")|r")
+            else
+                row.rating:SetText(color .. sign .. game.ratingChange .. "|r")
+            end
         else
             row.rating:SetText("|cff555555—|r")
         end
@@ -2148,9 +2165,6 @@ function RefreshHistory()
         local color = netRating >= 0 and "|cff00ff00" or "|cffff0000"
         ratingStr = " | Net: " .. color .. sign .. netRating .. "|r"
     end
-    historyFrame.title:SetText(BRANDED_TITLE .. " — " .. countStr .. " (" ..
-        "|cff00ff00" .. wins .. "W|r / |cffff0000" .. losses .. "L|r)" .. ratingStr)
-
     -- Update stats panel
     RefreshStats(filtered)
 end
@@ -2196,7 +2210,7 @@ local sessionBracketDD = CreateSearchableDropdown(sessionsContainer, "TkSBracket
         return "Bracket: " .. sessionFilters.bracket
     end,
 })
-sessionBracketDD.frame:SetPoint("TOPLEFT", sessionsContainer, "TOPLEFT", 12, -48)
+sessionBracketDD.frame:SetPoint("TOPLEFT", sessionsContainer, "TOPLEFT", 12, -10)
 
 local sessionDaysDD = CreateSearchableDropdown(sessionsContainer, "TkSDaysDD", 120, {
     defaultLabel = "Time: All",
@@ -2274,7 +2288,7 @@ local sessionPartnerDD = CreateSearchableDropdown(sessionsContainer, "TkSPartner
 sessionPartnerDD.frame:SetPoint("LEFT", sessionDaysDD.frame, "RIGHT", 10, 0)
 
 -- Session column headers
-local sessionHeaderY = -78
+local sessionHeaderY = -40
 local sessionHeaders = {
     { text = "#",        x = 4,   w = 24,  justify = "RIGHT" },
     { text = "Date",     x = 32,  w = 100, justify = "LEFT" },
@@ -2683,11 +2697,15 @@ function RefreshSessions()
                 end
                 mrow.enemy:SetText(enemyStr)
 
-                -- Rating: show change (e.g., "+16")
+                -- Rating: show after rating with change (e.g., "2341 (+16)")
                 if game.ratingChange then
                     local sign = game.ratingChange >= 0 and "+" or ""
                     local color = game.ratingChange >= 0 and "|cff00ff00" or "|cffff0000"
-                    mrow.rating:SetText(color .. sign .. game.ratingChange .. "|r")
+                    if game.ratingAfter then
+                        mrow.rating:SetText(color .. game.ratingAfter .. " (" .. sign .. game.ratingChange .. ")|r")
+                    else
+                        mrow.rating:SetText(color .. sign .. game.ratingChange .. "|r")
+                    end
                 else
                     mrow.rating:SetText("|cff555555—|r")
                 end
@@ -2719,8 +2737,6 @@ function RefreshSessions()
         local color = totalNetRating >= 0 and "|cff00ff00" or "|cffff0000"
         ratingStr = " | Net: " .. color .. sign .. totalNetRating .. "|r"
     end
-    historyFrame.title:SetText(BRANDED_TITLE .. " — " .. countStr .. " (" ..
-        "|cff00ff00" .. totalWins .. "W|r / |cffff0000" .. totalLosses .. "L|r)" .. ratingStr)
 end
 
 ---------------------------------------------------------------------------
@@ -2938,24 +2954,13 @@ function RefreshTeams()
     end
 
     teamContent:SetHeight(math.max(totalHeight, 1))
-
-    -- Update title
-    local count = #teams
-    historyFrame.title:SetText(BRANDED_TITLE .. " — " .. count .. " team" .. (count ~= 1 and "s" or ""))
 end
 
 local function ToggleHistory()
-    if historyFrame:IsShown() then
-        historyFrame:Hide()
+    if lib:IsOptionsPanelShown() then
+        lib:HideOptionsPanel()
     else
-        if activeTab == "sessions" then
-            RefreshSessions()
-        elseif activeTab == "teams" then
-            RefreshTeams()
-        else
-            RefreshHistory()
-        end
-        historyFrame:Show()
+        lib:ShowOptionsPanel("History")
     end
 end
 
@@ -3025,7 +3030,7 @@ minimapButton:SetScript("OnClick", function(self, button)
     elseif button == "RightButton" then
         local count = TrinketedHistoryDB and #TrinketedHistoryDB.games or 0
         print("|cff00ccff" .. DISPLAY_NAME .. ":|r " .. count .. " games recorded.")
-        print("  /trinketed history — toggle game history window")
+        print("  /trinketed history — toggle game history")
         print("  /trinketed export — export game history")
         print("  /trinketed import — import game history")
         print("  /trinketed minimap — toggle minimap button")
@@ -3363,7 +3368,7 @@ ShowImportDialog = function()
             -- Sort by startTime
             table.sort(TrinketedHistoryDB.games, function(a, b) return (a.startTime or 0) < (b.startTime or 0) end)
             print("|cff00ccff" .. DISPLAY_NAME .. ":|r Imported " .. added .. " new games (" .. #data.g .. " total in string, " .. (#data.g - added) .. " duplicates skipped).")
-            if historyFrame and historyFrame:IsShown() then
+            if historyContent:IsShown() then
                 if activeTab == "sessions" then RefreshSessions()
                 elseif activeTab == "teams" then RefreshTeams()
                 else RefreshHistory() end
@@ -3679,7 +3684,7 @@ local function RegisterSubCommands()
         if args == "confirm" then
             local old = TrinketedHistoryDB and #TrinketedHistoryDB.games or 0
             TrinketedHistoryDB.games = {}
-            if historyFrame:IsShown() then
+            if historyContent:IsShown() then
                 if activeTab == "sessions" then RefreshSessions()
                 elseif activeTab == "teams" then RefreshTeams()
                 else RefreshHistory() end
@@ -4161,43 +4166,43 @@ end
 ---------------------------------------------------------------------------
 -- Register with Trinketed Options Panel
 ---------------------------------------------------------------------------
+local settingsBuilt = false
+
 lib:RegisterSubAddon("History", {
     order = 2,
     OnSelect = function(contentFrame)
-        local C = lib.C
-        local info = contentFrame:CreateFontString(nil, "OVERLAY")
-        info:SetFont(lib.FONT_BODY, 12, "")
-        info:SetPoint("TOPLEFT", 20, -20)
-        info:SetTextColor(C.textNormal[1], C.textNormal[2], C.textNormal[3])
-        info:SetText("Arena match history and VOD timestamp overlay.\n\nUse |cffE8B923/trinketed history|r to open the history window.")
+        -- Build settings tab content on first open (after SavedVariables are loaded)
+        if not settingsBuilt then
+            settingsBuilt = true
+            local y = -20
+            y = lib:CreateSectionHeader(settingsContainer, y, "TIMESTAMP OVERLAY")
 
-        lib:CreateButton(contentFrame, 20, -70, 180, "Open History Window", function()
-            lib:HideOptionsPanel()
-            ToggleHistory()
-        end)
+            lib:CreateCheckbox(settingsContainer, 20, y, "Show timestamp when in queue",
+                TrinketedHistoryDB.settings.showTimestamp, function(isOn)
+                    TrinketedHistoryDB.settings.showTimestamp = isOn
+                    UpdateOverlayVisibility()
+                end)
 
-        local y = -120
-        y = lib:CreateSectionHeader(contentFrame, y, "TIMESTAMP OVERLAY")
+            y = y - 30
+            y = lib:CreateSectionHeader(settingsContainer, y, "GAME LOGGING")
 
-        lib:CreateCheckbox(contentFrame, 20, y, "Show timestamp when in queue",
-            TrinketedHistoryDB.settings.showTimestamp, function(isOn)
-                TrinketedHistoryDB.settings.showTimestamp = isOn
-                UpdateOverlayVisibility()
-            end)
+            lib:CreateCheckbox(settingsContainer, 20, y, "Record combat events for replay",
+                TrinketedHistoryDB.settings.enableGameLog, function(isOn)
+                    TrinketedHistoryDB.settings.enableGameLog = isOn
+                end)
 
-        y = y - 30
-        y = lib:CreateSectionHeader(contentFrame, y, "GAME LOGGING")
+            local note = settingsContainer:CreateFontString(nil, "OVERLAY")
+            note:SetFont(lib.FONT_BODY, 11, "")
+            note:SetPoint("TOPLEFT", 44, y - 22)
+            note:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
+            note:SetText("Captures all combat log events during arena matches.\nAdds ~200-400KB per game to saved data.")
+        end
 
-        lib:CreateCheckbox(contentFrame, 20, y, "Record combat events for replay",
-            TrinketedHistoryDB.settings.enableGameLog, function(isOn)
-                TrinketedHistoryDB.settings.enableGameLog = isOn
-            end)
-
-        local note = contentFrame:CreateFontString(nil, "OVERLAY")
-        note:SetFont(lib.FONT_BODY, 11, "")
-        note:SetPoint("TOPLEFT", 44, y - 22)
-        note:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
-        note:SetText("Captures all combat log events during arena matches.\nAdds ~200-400KB per game to saved data.")
+        -- Embed the history content directly in the options panel
+        historyContent:SetParent(contentFrame)
+        historyContent:ClearAllPoints()
+        historyContent:SetAllPoints(contentFrame)
+        historyContent:Show()
     end,
 })
 
