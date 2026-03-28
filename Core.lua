@@ -163,17 +163,26 @@ local SPEC_SPELLS = {
 local BRACKET_TO_RATED_INDEX = { [2] = 1, [3] = 2, [5] = 3 }
 
 ---------------------------------------------------------------------------
--- State
+-- State (ArenaBlackBox-style state machine)
 ---------------------------------------------------------------------------
 local debugMode = false
-local inArena = false
-local gameStarted = false
+local state = "IDLE" -- IDLE / IN_ARENA_PREP / RECORDING / SAVING
+local currentMatch = nil
+local relevantGUIDs = {}  -- GUID → true for all match participants
+local guidToRoster = {}   -- GUID → roster entry reference
+local drState = {}        -- drState[guid][drCategory] = { count, resetTime }
+local pollTicker = nil
+local snapshotTicker = nil
+local gatesOpenTime = nil -- GetTime() when gates opened (for relative timestamps)
+local ratingsBefore = nil
 local hadPrepBuff = false
-local currentGame = nil
-local guidToPlayer = {}   -- GUID → { team = "friendly"|"enemy", index = N }
-local snapshotTicker = nil -- periodic re-snapshot timer handle
-local needsReload = false  -- set after a game is saved, triggers reload on next queue
-local pendingSave = nil    -- set to "WIN"/"LOSS" when match ends, cleared after save
+local prevUnitState = {}     -- guid → signature string (delta-encoding)
+local prevAuraSnapshot = {}  -- guid → signature string (delta-encoding)
+local prevCooldownSig = nil  -- string signature of active cooldowns
+local needsReload = false    -- set after a game is saved, triggers reload on next queue
+local pendingSave = nil      -- set to "WIN"/"LOSS" when match ends, cleared after save
+local trinketLastStart = {}  -- GUID → last startTime from ARENA_COOLDOWNS_UPDATE (dedup)
+local lastTargets = {}       -- unit → targetGUID cache for change detection
 local UpdateOverlayVisibility  -- forward declaration
 
 ---------------------------------------------------------------------------
@@ -270,12 +279,12 @@ UpdateOverlayVisibility = function()
         return
     end
     -- Always hide during active game
-    if gameStarted then
+    if state == "RECORDING" then
         overlay:Hide()
         return
     end
     -- Show in arena prep room
-    if inArena and hadPrepBuff then
+    if state == "IN_ARENA_PREP" and hadPrepBuff then
         overlay:Show()
         return
     end
@@ -294,7 +303,7 @@ end
 -- Helpers
 ---------------------------------------------------------------------------
 local function FormatClassName(class)
-    if not class then return nil end
+    if not class or type(class) ~= "string" then return nil end
     return class:sub(1, 1):upper() .. class:sub(2):lower()
 end
 
@@ -312,6 +321,19 @@ local function StripRealm(name)
     return name:match("^([^%-]+)") or name
 end
 
+local function GetEpochTime()
+    return tsBaseEpoch + (GetTime() - tsBaseGetTime)
+end
+
+local function GetRelativeTime()
+    if not gatesOpenTime then return 0 end
+    return GetTime() - gatesOpenTime
+end
+
+local function IsRelevantGUID(guid)
+    return guid and relevantGUIDs[guid]
+end
+
 -- Snapshot all bracket ratings: returns { [1]=rating, [2]=rating, [3]=rating }
 local function SnapshotAllRatings()
     if not GetPersonalRatedInfo then return nil end
@@ -324,207 +346,966 @@ local function SnapshotAllRatings()
     return ratings
 end
 
-local MAX_LOG_EVENTS = 30000
-
-local function InitGameLog()
-    if not TrinketedHistoryDB.settings.enableGameLog then return end
-    if not currentGame then return end
-
-    -- Build initial state snapshot from visible units
-    local players = {}
-    local units = { "player" }
-    for i = 1, 4 do units[#units + 1] = "party" .. i end
-    for i = 1, 5 do units[#units + 1] = "arena" .. i end
-
-    for _, unit in ipairs(units) do
-        local guid = UnitGUID(unit)
-        if guid and not players[guid] then
-            local name = StripRealm(UnitName(unit))
-            local _, className = UnitClass(unit)
-            local team
-            if UnitIsUnit(unit, "player") or unit:match("^party") then
-                team = "friendly"
-            else
-                team = "enemy"
-            end
-            players[guid] = {
-                name = name,
-                class = FormatClassName(className),
-                team = team,
-                health = UnitHealth(unit),
-                healthMax = UnitHealthMax(unit),
-                power = UnitPower(unit),
-                powerMax = UnitPowerMax(unit),
-                powerType = UnitPowerType(unit),
-            }
-        end
-    end
-
-    local epochTs = math.floor((tsBaseEpoch + (GetTime() - tsBaseGetTime)) * 1000 + 0.5) / 1000
-    currentGame.gameLog = {
-        events = {},
-        initialState = { players = players, timestamp = epochTs },
-    }
-    dbg("InitGameLog(): captured", #units, "unit slots, snapshot ts:", epochTs)
+local function AppendEvent(event)
+    if not currentMatch or not currentMatch.events then return end
+    currentMatch.events[#currentMatch.events + 1] = event
 end
 
-local CLEU_NIL = "\0"  -- sentinel for nil values in CLEU arrays (preserved through JSON)
+local CompressEventLog  -- forward declaration
 
-local function RecordCLEUEvent()
-    if not currentGame or not currentGame.gameLog then return end
-    local events = currentGame.gameLog.events
-    if #events >= MAX_LOG_EVENTS then return end
+---------------------------------------------------------------------------
+-- SpellDB + DRList Enrichment
+---------------------------------------------------------------------------
+local DRList = LibStub("DRList-1.0", true)
 
-    -- Capture all args; replace nils with sentinel so JSON serialization
-    -- doesn't lose data (Lua's # operator stops at first nil gap)
-    local function packCLEU(...)
-        local n = select("#", ...)
-        local t = {}
-        for i = 1, n do
-            local v = select(i, ...)
-            t[i] = (v == nil) and CLEU_NIL or v
+local function EnrichEvent(event)
+    local spellID = event.spellID
+    if not spellID then return end
+
+    if DRList then
+        local drCat = DRList:GetCategoryBySpellID(spellID)
+        if drCat then
+            event.ccType = drCat
+            event.dr = drCat
         end
-        return t
     end
-    local info = packCLEU(CombatLogGetCurrentEventInfo())
 
-    -- Replace CLEU timestamp with epoch+ms
-    local cleuTs = info[1]
-    if cleuTs > 1000000000 then
-        info[1] = math.floor(cleuTs * 1000 + 0.5) / 1000
+    local dbEntry = SPELL_DB and SPELL_DB[spellID]
+    if dbEntry then
+        event.cat = dbEntry.cat
+        if dbEntry.dur then event.dur = dbEntry.dur end
+    end
+end
+
+---------------------------------------------------------------------------
+-- DR Tracking
+---------------------------------------------------------------------------
+local function UpdateDRState(dstGUID, drCat, event)
+    if not drState[dstGUID] then drState[dstGUID] = {} end
+    local dr = drState[dstGUID][drCat]
+
+    if not dr or GetTime() > dr.resetTime then
+        drState[dstGUID][drCat] = {
+            count = 1,
+            resetTime = GetTime() + (DRList and DRList.GetResetTime and DRList:GetResetTime(drCat) or 18)
+        }
+        event.drCount = 1
+        event.drMultiplier = 1.0
     else
-        info[1] = math.floor((tsBaseEpoch + (cleuTs - tsBaseGetTime)) * 1000 + 0.5) / 1000
+        dr.count = dr.count + 1
+        event.drCount = dr.count
+        event.drMultiplier = (DRList and DRList.GetNextDR) and DRList:GetNextDR(dr.count, drCat) or
+            ({ [2] = 0.5, [3] = 0.25 })[dr.count] or 0
+        dr.resetTime = GetTime() + (DRList and DRList.GetResetTime and DRList:GetResetTime(drCat) or 18)
     end
-    events[#events + 1] = info
 end
 
-local CompressGameLog  -- forward declaration; body defined after TableToJSON/LibDeflate
+---------------------------------------------------------------------------
+-- Roster Management
+---------------------------------------------------------------------------
+local function AddToRoster(guid, name, class, race, team, unit)
+    if not currentMatch or not guid then return end
+    if currentMatch.roster[guid] then return end -- already known
 
-local function ResetGameState()
-    dbg("ResetGameState()")
-    gameStarted = false
+    local specName = nil
+    -- Try GetArenaOpponentSpec for arena units
+    if unit and unit:match("^arena") then
+        local arenaIndex = tonumber(unit:match("(%d+)"))
+        if arenaIndex and GetArenaOpponentSpec and GetSpecializationInfoByID then
+            local specID = GetArenaOpponentSpec(arenaIndex)
+            if specID and specID > 0 then
+                local _, sn = GetSpecializationInfoByID(specID)
+                specName = sn
+            end
+        end
+    end
+
+    local entry = {
+        name = StripRealm(name),
+        class = FormatClassName(class),
+        race = race,
+        spec = specName,
+        team = team,
+    }
+
+    currentMatch.roster[guid] = entry
+    relevantGUIDs[guid] = true
+    guidToRoster[guid] = entry
+
+    dbg("Roster add:", entry.name, entry.class, entry.spec or "?", team)
+
+    -- Emit player_entered event
+    AppendEvent({
+        t = GetRelativeTime(),
+        type = "player_entered",
+        guid = guid,
+        name = entry.name,
+        class = entry.class,
+        race = entry.race,
+        team = team,
+    })
+end
+
+local function SnapshotRoster()
+    if not currentMatch then return end
+
+    -- Player
+    local playerGUID = UnitGUID("player")
+    local playerName = UnitName("player")
+    local _, playerClass = UnitClass("player")
+    local playerRace = UnitRace("player")
+    AddToRoster(playerGUID, playerName, playerClass, playerRace, "friendly", "player")
+
+    -- Party
+    for i = 1, 4 do
+        local unit = "party" .. i
+        local guid = UnitGUID(unit)
+        local name = UnitName(unit)
+        local _, className = UnitClass(unit)
+        local race = UnitRace(unit)
+        if guid and name then
+            AddToRoster(guid, name, className, race, "friendly", unit)
+        end
+    end
+
+    -- Arena opponents
+    for i = 1, 5 do
+        local unit = "arena" .. i
+        local guid = UnitGUID(unit)
+        local name = UnitName(unit)
+        local _, className = UnitClass(unit)
+        local race = UnitRace(unit)
+        if guid and name then
+            AddToRoster(guid, name, className, race, "enemy", unit)
+        end
+    end
+end
+
+local function DiscoverPlayerByGUID(guid)
+    if not guid or not currentMatch then return end
+    if relevantGUIDs[guid] then return end
+
+    -- Check arena units
+    for i = 1, 5 do
+        local unit = "arena" .. i
+        if UnitGUID(unit) == guid then
+            local name = UnitName(unit)
+            local _, className = UnitClass(unit)
+            local race = UnitRace(unit)
+            if name and className then
+                AddToRoster(guid, name, className, race, "enemy", unit)
+            end
+            return
+        end
+    end
+
+    -- Check player
+    if guid == UnitGUID("player") then
+        local name = UnitName("player")
+        local _, className = UnitClass("player")
+        local race = UnitRace("player")
+        AddToRoster(guid, name, className, race, "friendly", "player")
+        return
+    end
+
+    -- Check party
+    for i = 1, 4 do
+        local unit = "party" .. i
+        if UnitGUID(unit) == guid then
+            local name = UnitName(unit)
+            local _, className = UnitClass(unit)
+            local race = UnitRace(unit)
+            if name and className then
+                AddToRoster(guid, name, className, race, "friendly", unit)
+            end
+            return
+        end
+    end
+end
+
+local function AssignSpec(guid, spellName)
+    local specInfo = SPEC_SPELLS[spellName]
+    if not specInfo or not currentMatch then return end
+
+    local entry = guidToRoster[guid]
+    if not entry then return end
+    if entry.class and entry.class ~= specInfo.class then return end
+    if entry.spec then return end
+
+    entry.spec = specInfo.spec
+    dbg("Spec detected:", entry.name, "=", specInfo.spec, "(from", spellName .. ")")
+    print("|cff00ccff" .. DISPLAY_NAME .. ":|r Spec detected: " ..
+        "|c" .. (CLASS_COLORS[entry.class] or "ffffffff") .. entry.name .. "|r" ..
+        " = " .. specInfo.spec)
+end
+
+---------------------------------------------------------------------------
+-- CLEU Event Building
+---------------------------------------------------------------------------
+local DAMAGE_SUBEVENTS = {
+    SPELL_DAMAGE           = "direct",
+    SPELL_PERIODIC_DAMAGE  = "periodic",
+    SWING_DAMAGE           = "auto_melee",
+    RANGE_DAMAGE           = "auto_ranged",
+    DAMAGE_SHIELD          = "shield",
+    DAMAGE_SPLIT           = "split",
+    ENVIRONMENTAL_DAMAGE   = "env",
+}
+
+local HEAL_SUBEVENTS = {
+    SPELL_HEAL             = "direct",
+    SPELL_PERIODIC_HEAL    = "periodic",
+}
+
+local MISS_SUBEVENTS = {
+    SPELL_MISSED           = true,
+    SWING_MISSED           = true,
+    RANGE_MISSED           = true,
+    SPELL_PERIODIC_MISSED  = true,
+    DAMAGE_SHIELD_MISSED   = true,
+}
+
+local function BuildDamageEvent(subevent, info, t)
+    local subtype = DAMAGE_SUBEVENTS[subevent]
+    local srcGUID, srcName = info[4], info[5]
+    local dstGUID, dstName = info[8], info[9]
+
+    if subevent == "SWING_DAMAGE" then
+        local amount, overkill, school, _, _, _, _, _, absorbed, critical = info[12], info[13], info[14], info[15], info[16], info[17], info[18], info[19], info[20], info[21]
+        return {
+            t = t, type = "damage", subtype = subtype,
+            src = StripRealm(srcName), srcGUID = srcGUID,
+            dst = StripRealm(dstName), dstGUID = dstGUID,
+            school = school, amount = amount, overkill = overkill,
+            absorbed = absorbed, critical = critical,
+        }
+    elseif subevent == "ENVIRONMENTAL_DAMAGE" then
+        local envType = info[12]
+        local amount, overkill, school = info[13], info[14], info[15]
+        return {
+            t = t, type = "damage", subtype = subtype,
+            dst = StripRealm(dstName), dstGUID = dstGUID,
+            envType = envType, school = school, amount = amount, overkill = overkill,
+        }
+    else
+        local spellID, spellName, spellSchool = info[12], info[13], info[14]
+        local amount, overkill, school, _, _, _, absorbed, critical = info[15], info[16], info[17], info[18], info[19], info[20], info[21], info[22]
+        return {
+            t = t, type = "damage", subtype = subtype,
+            src = StripRealm(srcName), srcGUID = srcGUID,
+            dst = StripRealm(dstName), dstGUID = dstGUID,
+            spellID = spellID, spell = spellName, school = spellSchool or school,
+            amount = amount, overkill = overkill, absorbed = absorbed, critical = critical,
+        }
+    end
+end
+
+local function BuildHealEvent(subevent, info, t)
+    local subtype = HEAL_SUBEVENTS[subevent]
+    local srcGUID, srcName = info[4], info[5]
+    local dstGUID, dstName = info[8], info[9]
+    local spellID, spellName = info[12], info[13]
+    local amount, overhealing, absorbed, critical = info[15], info[16], info[17], info[18]
+
+    return {
+        t = t, type = "heal", subtype = subtype,
+        src = StripRealm(srcName), srcGUID = srcGUID,
+        dst = StripRealm(dstName), dstGUID = dstGUID,
+        spellID = spellID, spell = spellName,
+        amount = amount, overhealing = overhealing, absorbed = absorbed, critical = critical,
+    }
+end
+
+local function BuildMissEvent(subevent, info, t)
+    local srcGUID, srcName = info[4], info[5]
+    local dstGUID, dstName = info[8], info[9]
+
+    if subevent == "SWING_MISSED" then
+        local missType, _, amountMissed = info[12], info[13], info[14]
+        return {
+            t = t, type = "miss", subtype = "swing",
+            src = StripRealm(srcName), srcGUID = srcGUID,
+            dst = StripRealm(dstName), dstGUID = dstGUID,
+            missType = missType, amountMissed = amountMissed,
+        }
+    else
+        local spellID, spellName = info[12], info[13]
+        local missType, _, amountMissed = info[15], info[16], info[17]
+        local prefix = subevent:match("^(.+)_MISSED$")
+        return {
+            t = t, type = "miss", subtype = prefix and prefix:lower() or "spell",
+            src = StripRealm(srcName), srcGUID = srcGUID,
+            dst = StripRealm(dstName), dstGUID = dstGUID,
+            spellID = spellID, spell = spellName,
+            missType = missType, amountMissed = amountMissed,
+        }
+    end
+end
+
+local function OnCLEU()
+    local info = { CombatLogGetCurrentEventInfo() }
+    local timestamp, subevent, hideCaster = info[1], info[2], info[3]
+    local srcGUID, srcName, srcFlags, srcRaidFlags = info[4], info[5], info[6], info[7]
+    local dstGUID, dstName, dstFlags, dstRaidFlags = info[8], info[9], info[10], info[11]
+
+    if state ~= "RECORDING" then return end
+
+    -- Try to discover unknown GUIDs
+    if srcGUID and not relevantGUIDs[srcGUID] then DiscoverPlayerByGUID(srcGUID) end
+    if dstGUID and dstGUID ~= srcGUID and not relevantGUIDs[dstGUID] then DiscoverPlayerByGUID(dstGUID) end
+
+    -- Filter: only record events involving match participants
+    if not IsRelevantGUID(srcGUID) and not IsRelevantGUID(dstGUID) then return end
+
+    local t = GetRelativeTime()
+    local event = nil
+
+    -- Spec detection
+    if srcGUID and relevantGUIDs[srcGUID] then
+        local spellName = info[13]
+        if spellName and SPEC_SPELLS[spellName] then
+            AssignSpec(srcGUID, spellName)
+        end
+    end
+
+    -- Build event based on subevent type
+    if DAMAGE_SUBEVENTS[subevent] then
+        event = BuildDamageEvent(subevent, info, t)
+
+    elseif HEAL_SUBEVENTS[subevent] then
+        event = BuildHealEvent(subevent, info, t)
+
+    elseif MISS_SUBEVENTS[subevent] then
+        event = BuildMissEvent(subevent, info, t)
+
+    elseif subevent == "SPELL_AURA_APPLIED" then
+        local spellID, spellName, _, auraType = info[12], info[13], info[14], info[15]
+        event = {
+            t = t, type = "aura_applied",
+            src = StripRealm(srcName), srcGUID = srcGUID,
+            dst = StripRealm(dstName), dstGUID = dstGUID,
+            spellID = spellID, spell = spellName, auraType = auraType,
+        }
+
+    elseif subevent == "SPELL_AURA_REMOVED" then
+        local spellID, spellName, _, auraType = info[12], info[13], info[14], info[15]
+        event = {
+            t = t, type = "aura_removed",
+            dst = StripRealm(dstName), dstGUID = dstGUID,
+            spellID = spellID, spell = spellName, auraType = auraType,
+        }
+
+    elseif subevent == "SPELL_AURA_REFRESH" then
+        local spellID, spellName = info[12], info[13]
+        event = {
+            t = t, type = "aura_refresh",
+            dst = StripRealm(dstName), dstGUID = dstGUID,
+            spellID = spellID, spell = spellName,
+        }
+
+    elseif subevent == "SPELL_AURA_APPLIED_DOSE" or subevent == "SPELL_AURA_REMOVED_DOSE" then
+        local spellID, spellName, _, auraType, stacks = info[12], info[13], info[14], info[15], info[16]
+        event = {
+            t = t, type = "aura_dose",
+            dst = StripRealm(dstName), dstGUID = dstGUID,
+            spellID = spellID, spell = spellName, stacks = stacks,
+        }
+
+    elseif subevent == "SPELL_AURA_BROKEN_SPELL" then
+        local spellID, spellName = info[12], info[13]
+        local extraSpellID, extraSpellName = info[15], info[16]
+        event = {
+            t = t, type = "aura_break",
+            src = StripRealm(srcName), srcGUID = srcGUID,
+            dst = StripRealm(dstName), dstGUID = dstGUID,
+            spellID = spellID, spell = spellName,
+            extraSpellID = extraSpellID, extraSpell = extraSpellName,
+        }
+
+    elseif subevent == "SPELL_AURA_BROKEN" then
+        local spellID, spellName = info[12], info[13]
+        event = {
+            t = t, type = "aura_break",
+            src = StripRealm(srcName), srcGUID = srcGUID,
+            dst = StripRealm(dstName), dstGUID = dstGUID,
+            spellID = spellID, spell = spellName,
+        }
+
+    elseif subevent == "SPELL_CAST_START" then
+        local spellID, spellName = info[12], info[13]
+        event = {
+            t = t, type = "cast_start",
+            src = StripRealm(srcName), srcGUID = srcGUID,
+            dst = StripRealm(dstName), dstGUID = dstGUID,
+            spellID = spellID, spell = spellName,
+        }
+
+    elseif subevent == "SPELL_CAST_SUCCESS" then
+        local spellID, spellName = info[12], info[13]
+        event = {
+            t = t, type = "cast_success",
+            src = StripRealm(srcName), srcGUID = srcGUID,
+            dst = StripRealm(dstName), dstGUID = dstGUID,
+            spellID = spellID, spell = spellName,
+        }
+
+    elseif subevent == "SPELL_CAST_FAILED" then
+        local spellID, spellName = info[12], info[13]
+        local failReason = info[15]
+        event = {
+            t = t, type = "cast_fail",
+            src = StripRealm(srcName), srcGUID = srcGUID,
+            spellID = spellID, spell = spellName, failReason = failReason,
+        }
+
+    elseif subevent == "SPELL_INTERRUPT" then
+        local spellID, spellName = info[12], info[13]
+        local extraSpellID, extraSpellName = info[15], info[16]
+        event = {
+            t = t, type = "interrupt",
+            src = StripRealm(srcName), srcGUID = srcGUID,
+            dst = StripRealm(dstName), dstGUID = dstGUID,
+            spellID = spellID, spell = spellName,
+            extraSpellID = extraSpellID, extraSpell = extraSpellName,
+        }
+
+    elseif subevent == "SPELL_DISPEL" then
+        local spellID, spellName = info[12], info[13]
+        local extraSpellID, extraSpellName, _, auraType = info[15], info[16], info[17], info[18]
+        event = {
+            t = t, type = "dispel",
+            src = StripRealm(srcName), srcGUID = srcGUID,
+            dst = StripRealm(dstName), dstGUID = dstGUID,
+            spellID = spellID, spell = spellName,
+            extraSpellID = extraSpellID, extraSpell = extraSpellName, auraType = auraType,
+        }
+
+    elseif subevent == "SPELL_STOLEN" then
+        local spellID, spellName = info[12], info[13]
+        local extraSpellID, extraSpellName = info[15], info[16]
+        event = {
+            t = t, type = "steal",
+            src = StripRealm(srcName), srcGUID = srcGUID,
+            dst = StripRealm(dstName), dstGUID = dstGUID,
+            spellID = spellID, spell = spellName,
+            extraSpellID = extraSpellID, extraSpell = extraSpellName,
+        }
+
+    elseif subevent == "SPELL_ABSORBED" then
+        local absorbSrcGUID, absorbSrcName, absorbSpellID, absorbSpellName, absorbAmount
+        if type(info[12]) == "number" then
+            absorbSrcGUID = info[15]
+            absorbSrcName = info[16]
+            absorbSpellID = info[19]
+            absorbSpellName = info[20]
+            absorbAmount = info[22]
+        else
+            absorbSrcGUID = info[12]
+            absorbSrcName = info[13]
+            absorbSpellID = info[16]
+            absorbSpellName = info[17]
+            absorbAmount = info[19]
+        end
+        event = {
+            t = t, type = "absorb",
+            src = StripRealm(absorbSrcName), srcGUID = absorbSrcGUID,
+            dst = StripRealm(dstName), dstGUID = dstGUID,
+            spellID = absorbSpellID, spell = absorbSpellName,
+            amount = absorbAmount,
+        }
+
+    elseif subevent == "SPELL_ENERGIZE" or subevent == "SPELL_PERIODIC_ENERGIZE" then
+        local spellID, spellName = info[12], info[13]
+        local amount, _, powerType = info[15], info[16], info[17]
+        event = {
+            t = t, type = "energize",
+            src = StripRealm(srcName), srcGUID = srcGUID,
+            dst = StripRealm(dstName), dstGUID = dstGUID,
+            spellID = spellID, spell = spellName,
+            amount = amount, powerType = powerType,
+        }
+
+    elseif subevent == "SPELL_DRAIN" or subevent == "SPELL_LEECH" then
+        local spellID, spellName = info[12], info[13]
+        local amount, powerType = info[15], info[17]
+        event = {
+            t = t, type = "drain",
+            src = StripRealm(srcName), srcGUID = srcGUID,
+            dst = StripRealm(dstName), dstGUID = dstGUID,
+            spellID = spellID, spell = spellName,
+            amount = amount, powerType = powerType,
+        }
+
+    elseif subevent == "SPELL_SUMMON" then
+        local spellID, spellName = info[12], info[13]
+        event = {
+            t = t, type = "summon",
+            src = StripRealm(srcName), srcGUID = srcGUID,
+            dst = StripRealm(dstName), dstGUID = dstGUID,
+            spellID = spellID, spell = spellName,
+        }
+        -- Track summoned creatures as relevant (pets, totems, etc.)
+        if dstGUID then relevantGUIDs[dstGUID] = true end
+
+    elseif subevent == "UNIT_DIED" or subevent == "UNIT_DESTROYED" then
+        event = {
+            t = t, type = "death",
+            dst = StripRealm(dstName), dstGUID = dstGUID,
+        }
+
+    elseif subevent == "SPELL_EXTRA_ATTACKS" then
+        local spellID, spellName = info[12], info[13]
+        local amount = info[15]
+        event = {
+            t = t, type = "extra_attacks",
+            src = StripRealm(srcName), srcGUID = srcGUID,
+            spellID = spellID, spell = spellName, amount = amount,
+        }
+    end
+
+    -- Enrich and append
+    if event then
+        EnrichEvent(event)
+
+        -- DR tracking for aura_applied with CC
+        if event.type == "aura_applied" and event.dr and dstGUID then
+            UpdateDRState(dstGUID, event.dr, event)
+        end
+
+        AppendEvent(event)
+    end
+end
+
+---------------------------------------------------------------------------
+-- Polling (200ms)
+---------------------------------------------------------------------------
+local ALL_UNITS = { "player", "party1", "party2", "party3", "party4",
+                    "arena1", "arena2", "arena3", "arena4", "arena5" }
+
+local function PollUnitState(unit, t)
+    local guid = UnitGUID(unit)
+    if not guid or not IsRelevantGUID(guid) then return end
+
+    local hp = UnitHealth(unit)
+    local hpMax = UnitHealthMax(unit)
+    local power = UnitPower(unit)
+    local powerMax = UnitPowerMax(unit)
+    local powerType = UnitPowerType(unit)
+
+    -- TBC Anniversary: enemy arena units return percentage HP (0-100) not actual values
+    local hpIsPercent = (hpMax == 100 and unit:match("^arena"))
+
+    local targetName = UnitName(unit .. "target")
+    local targetGUID = UnitGUID(unit .. "target")
+
+    -- Casting info
+    local castName, _, _, castStart, castEnd, _, _, _, castSpellID
+    if UnitCastingInfo then
+        castName, _, _, castStart, castEnd, _, _, _, castSpellID = UnitCastingInfo(unit)
+    end
+
+    local chanName, _, _, chanStart, chanEnd, _, _, chanSpellID
+    if UnitChannelInfo then
+        chanName, _, _, chanStart, chanEnd, _, _, chanSpellID = UnitChannelInfo(unit)
+    end
+
+    -- Delta-encode: skip if nothing meaningful changed
+    local sig = hp .. "|" .. hpMax .. "|" .. power .. "|" .. powerMax .. "|" .. powerType
+        .. "|" .. (targetGUID or "") .. "|" .. (castName or "") .. "|" .. (chanName or "")
+    if prevUnitState[guid] == sig then return end
+    prevUnitState[guid] = sig
+
+    AppendEvent({
+        t = t, type = "unit_state",
+        guid = guid,
+        hp = hp, hpMax = hpMax, hpPct = hpIsPercent or nil,
+        power = power, powerMax = powerMax, powerType = powerType,
+        target = StripRealm(targetName), targetGUID = targetGUID,
+        casting = castName, castSpellID = castSpellID,
+        castEnd = castEnd and (castEnd / 1000) or nil,
+        channeling = chanName, channelSpellID = chanSpellID,
+        channelEnd = chanEnd and (chanEnd / 1000) or nil,
+    })
+end
+
+local function PollUnitAuras(unit, t)
+    local guid = UnitGUID(unit)
+    if not guid or not IsRelevantGUID(guid) then return end
+
+    local auras = {}
+
+    -- Buffs (HELPFUL)
+    for i = 1, 40 do
+        local name, _, stacks, auraType, duration, expires, source, _, _, spellID = UnitAura(unit, i, "HELPFUL")
+        if not name then break end
+        local entry = {
+            spellID = spellID, spell = name, auraType = "BUFF",
+            stacks = (stacks and stacks > 0) and stacks or nil,
+            duration = duration, expires = expires,
+        }
+        if DRList then
+            local drCat = DRList:GetCategoryBySpellID(spellID)
+            if drCat then entry.ccType = drCat; entry.dr = drCat end
+        end
+        local db = SPELL_DB and SPELL_DB[spellID]
+        if db then entry.cat = db.cat end
+        auras[#auras + 1] = entry
+    end
+
+    -- Debuffs (HARMFUL)
+    for i = 1, 40 do
+        local name, _, stacks, auraType, duration, expires, source, _, _, spellID = UnitAura(unit, i, "HARMFUL")
+        if not name then break end
+        local entry = {
+            spellID = spellID, spell = name, auraType = "DEBUFF",
+            stacks = (stacks and stacks > 0) and stacks or nil,
+            duration = duration, expires = expires,
+        }
+        if DRList then
+            local drCat = DRList:GetCategoryBySpellID(spellID)
+            if drCat then entry.ccType = drCat; entry.dr = drCat end
+        end
+        local db = SPELL_DB and SPELL_DB[spellID]
+        if db then entry.cat = db.cat end
+        auras[#auras + 1] = entry
+    end
+
+    if #auras > 0 then
+        -- Delta-encode: build signature from spellID:stacks:auraType
+        local sigParts = {}
+        for _, a in ipairs(auras) do
+            sigParts[#sigParts + 1] = a.spellID .. ":" .. (a.stacks or 1) .. ":" .. a.auraType
+        end
+        table.sort(sigParts)
+        local sig = table.concat(sigParts, ",")
+
+        if prevAuraSnapshot[guid] == sig then return end
+        prevAuraSnapshot[guid] = sig
+
+        AppendEvent({ t = t, type = "aura_snapshot", guid = guid, auras = auras })
+    else
+        if prevAuraSnapshot[guid] then
+            prevAuraSnapshot[guid] = nil
+            AppendEvent({ t = t, type = "aura_snapshot", guid = guid, auras = {} })
+        end
+    end
+end
+
+local function PollPlayerCooldowns(t)
+    if not TRACKED_COOLDOWN_SPELLS then return end
+
+    local cooldowns = {}
+    for _, spellID in ipairs(TRACKED_COOLDOWN_SPELLS) do
+        local start, duration, enabled = GetSpellCooldown(spellID)
+        if start and start > 0 and duration > 1.5 then
+            local remaining = (start + duration) - GetTime()
+            if remaining > 0 then
+                local spellName = GetSpellInfo(spellID)
+                local db = SPELL_DB and SPELL_DB[spellID]
+                cooldowns[#cooldowns + 1] = {
+                    spellID = spellID,
+                    spell = spellName,
+                    start = start,
+                    duration = duration,
+                    cat = db and db.cat or nil,
+                }
+            end
+        end
+    end
+
+    if #cooldowns > 0 then
+        -- Delta-encode: skip if same set of spells on cooldown
+        local sigParts = {}
+        for _, cd in ipairs(cooldowns) do
+            sigParts[#sigParts + 1] = cd.spellID
+        end
+        table.sort(sigParts)
+        local sig = table.concat(sigParts, ",")
+
+        if prevCooldownSig == sig then return end
+        prevCooldownSig = sig
+
+        AppendEvent({ t = t, type = "cooldown_state", cooldowns = cooldowns })
+    elseif prevCooldownSig then
+        prevCooldownSig = nil
+        AppendEvent({ t = t, type = "cooldown_state", cooldowns = {} })
+    end
+end
+
+local function PollAllUnits()
+    if state ~= "RECORDING" then return end
+
+    local t = GetRelativeTime()
+
+    for _, unit in ipairs(ALL_UNITS) do
+        PollUnitState(unit, t)
+        PollUnitAuras(unit, t)
+    end
+
+    PollPlayerCooldowns(t)
+end
+
+---------------------------------------------------------------------------
+-- Target/Focus Change Events
+---------------------------------------------------------------------------
+local function OnUnitTarget(unit)
+    if state ~= "RECORDING" then return end
+    local guid = UnitGUID(unit)
+    if not guid or not IsRelevantGUID(guid) then return end
+
+    local targetGUID = UnitGUID(unit .. "target")
+    local targetName = UnitName(unit .. "target")
+
+    -- Deduplicate
+    if lastTargets[guid] == targetGUID then return end
+    lastTargets[guid] = targetGUID
+
+    AppendEvent({
+        t = GetRelativeTime(),
+        type = "target_change",
+        guid = guid,
+        target = StripRealm(targetName),
+        targetGUID = targetGUID,
+    })
+end
+
+local function OnFocusChanged()
+    if state ~= "RECORDING" then return end
+    local guid = UnitGUID("player")
+    local focusGUID = UnitGUID("focus")
+    local focusName = UnitName("focus")
+
+    AppendEvent({
+        t = GetRelativeTime(),
+        type = "focus_change",
+        guid = guid,
+        target = StripRealm(focusName),
+        targetGUID = focusGUID,
+    })
+end
+
+---------------------------------------------------------------------------
+-- Loss of Control
+---------------------------------------------------------------------------
+local function OnLossOfControl()
+    if state ~= "RECORDING" then return end
+    if not C_LossOfControl or not C_LossOfControl.GetActiveLossOfControlData then return end
+
+    local numEvents = C_LossOfControl.GetNumEvents and C_LossOfControl.GetNumEvents() or 0
+    for i = 1, numEvents do
+        local data = C_LossOfControl.GetActiveLossOfControlData(i)
+        if data then
+            AppendEvent({
+                t = GetRelativeTime(),
+                type = "loss_of_control",
+                locType = data.locType,
+                spellID = data.spellID,
+                duration = data.duration,
+                startTime = data.startTime,
+                endTime = data.endTime,
+            })
+        end
+    end
+end
+
+---------------------------------------------------------------------------
+-- Match Lifecycle
+---------------------------------------------------------------------------
+local function ResetMatchState()
+    state = "IDLE"
+    currentMatch = nil
+    relevantGUIDs = {}
+    guidToRoster = {}
+    drState = {}
+    lastTargets = {}
+    trinketLastStart = {}
+    gatesOpenTime = nil
+    ratingsBefore = nil
     hadPrepBuff = false
-    pendingSave = nil
-    guidToPlayer = {}
-    -- Stop periodic re-snapshot ticker if running
+    wipe(prevUnitState)
+    wipe(prevAuraSnapshot)
+    prevCooldownSig = nil
+    if pollTicker then
+        pollTicker:Cancel()
+        pollTicker = nil
+    end
     if snapshotTicker then
         snapshotTicker:Cancel()
         snapshotTicker = nil
     end
-    currentGame = {
+end
+
+local function InitMatch()
+    currentMatch = {
         startTime = nil,
         endTime = nil,
         map = GetRealZoneText(),
-        enemyComp = {},
         result = nil,
-        friendlyTeam = {},
-        enemyTeam = {},
-        ratingsBefore = nil,  -- { [1]=2v2, [2]=3v3, [3]=5v5 } snapshot before game
-        bracket = nil,
+        duration = nil,
+        playerGUID = UnitGUID("player"),
+        playerName = StripRealm(UnitName("player")),
         ratingBefore = nil,
         ratingAfter = nil,
         ratingChange = nil,
-        gameLog = nil,
+        roster = {},
+        events = {},
     }
+    relevantGUIDs = {}
+    guidToRoster = {}
+    drState = {}
+    lastTargets = {}
 end
 
-local function SaveGame(result)
-    dbg("SaveGame() called with result:", result)
-    if not currentGame or not currentGame.startTime then
-        dbg("SaveGame() aborted — no currentGame or startTime")
+local function StartRecording()
+    state = "RECORDING"
+    gatesOpenTime = GetTime()
+    currentMatch.startTime = GetEpochTime()
+
+    -- Snapshot ratings
+    ratingsBefore = SnapshotAllRatings()
+
+    -- Snapshot roster
+    SnapshotRoster()
+
+    -- Emit gates_open
+    AppendEvent({ t = 0, type = "gates_open" })
+
+    -- Start 200ms polling
+    pollTicker = C_Timer.NewTicker(0.2, PollAllUnits)
+
+    -- Periodic re-snapshot for stealth players
+    snapshotTicker = C_Timer.NewTicker(2, function()
+        if state == "RECORDING" then
+            SnapshotRoster()
+        end
+    end)
+
+    -- Enable advanced combat logging
+    if SetCVar then
+        SetCVar("advancedCombatLogging", "1")
+    end
+
+    local rosterCount = 0
+    for _ in pairs(currentMatch.roster) do rosterCount = rosterCount + 1 end
+    print("|cff00ccff" .. DISPLAY_NAME .. ":|r Gates open — recording started (" .. rosterCount .. " players)")
+end
+
+local function SaveMatch(result)
+    if not currentMatch or not currentMatch.startTime then
+        dbg("SaveMatch() aborted — no match data")
         return
     end
 
-    currentGame.endTime = time()
-    currentGame.result = result
+    state = "SAVING"
 
-    -- Capture post-game rating: snapshot all brackets and compare to before
-    if currentGame.ratingsBefore then
+    currentMatch.endTime = GetEpochTime()
+    currentMatch.result = result
+    currentMatch.duration = gatesOpenTime and (GetTime() - gatesOpenTime) or 0
+
+    -- Rating
+    if ratingsBefore then
         local ratingsAfter = SnapshotAllRatings()
         if ratingsAfter then
-            -- Find which bracket changed
             for i = 1, 3 do
-                local before = currentGame.ratingsBefore[i] or 0
+                local before = ratingsBefore[i] or 0
                 local after = ratingsAfter[i] or 0
                 if before > 0 and after > 0 and before ~= after then
-                    local bracketNames = { "2v2", "3v3", "5v5" }
-                    currentGame.bracket = bracketNames[i]
-                    currentGame.ratingBefore = before
-                    currentGame.ratingAfter = after
-                    currentGame.ratingChange = after - before
-                    dbg("  Rating detected via bracket", bracketNames[i], ":", before, "→", after, "(change:", currentGame.ratingChange .. ")")
+                    currentMatch.ratingBefore = before
+                    currentMatch.ratingAfter = after
+                    currentMatch.ratingChange = after - before
+                    dbg("  Rating detected:", before, "→", after, "(change:", currentMatch.ratingChange .. ")")
                     break
                 end
             end
         end
     end
+
     -- Fallback: try GetBattlefieldScore for ratingChange from scoreboard
-    if not currentGame.ratingChange and GetBattlefieldScore then
+    if not currentMatch.ratingChange and GetBattlefieldScore then
         local playerName = StripRealm(UnitName("player"))
         local numScores = GetNumBattlefieldScores and GetNumBattlefieldScores() or 0
         for si = 1, numScores do
             local name, _, _, _, _, _, _, _, _, _, _, bgRating, ratingChange = GetBattlefieldScore(si)
             if name and StripRealm(name) == playerName and ratingChange and ratingChange ~= 0 then
-                currentGame.ratingBefore = currentGame.ratingBefore or (bgRating or 0)
-                currentGame.ratingChange = ratingChange
-                currentGame.ratingAfter = (currentGame.ratingBefore or 0) + ratingChange
-                dbg("  Rating (scoreboard fallback):", currentGame.ratingBefore, "change:", ratingChange)
+                currentMatch.ratingBefore = currentMatch.ratingBefore or (bgRating or 0)
+                currentMatch.ratingChange = ratingChange
+                currentMatch.ratingAfter = (currentMatch.ratingBefore or 0) + ratingChange
+                dbg("  Rating (scoreboard fallback):", currentMatch.ratingBefore, "change:", ratingChange)
                 break
             end
         end
     end
 
-    -- Capture per-player rating changes from the scoreboard
+    -- Per-player rating changes from scoreboard
     if GetBattlefieldScore and GetNumBattlefieldScores then
-        local playerFaction = GetBattlefieldArenaFaction()
         local numScores = GetNumBattlefieldScores() or 0
         for si = 1, numScores do
-            local name, _, _, _, _, faction, _, _, _, _, _, _, ratingChange = GetBattlefieldScore(si)
+            local name, _, _, _, _, _, _, _, _, _, _, _, ratingChange = GetBattlefieldScore(si)
             if name then
                 local cleanName = StripRealm(name)
-                -- Match scoreboard entries to our tracked players by name
-                if faction ~= playerFaction then
-                    -- Enemy player
-                    for _, p in ipairs(currentGame.enemyTeam) do
-                        if p.name == cleanName then
-                            p.ratingChange = ratingChange
-                            dbg("  Enemy scoreboard:", cleanName, "ratingChange=" .. tostring(ratingChange))
-                            break
-                        end
-                    end
-                else
-                    -- Friendly player
-                    for _, p in ipairs(currentGame.friendlyTeam) do
-                        if p.name == cleanName then
-                            p.ratingChange = ratingChange
-                            dbg("  Friendly scoreboard:", cleanName, "ratingChange=" .. tostring(ratingChange))
-                            break
-                        end
+                for guid, entry in pairs(currentMatch.roster) do
+                    if entry.name == cleanName then
+                        entry.ratingChange = ratingChange
                     end
                 end
             end
         end
     end
 
-    dbg("  startTime:", currentGame.startTime, "endTime:", currentGame.endTime)
-    dbg("  enemyComp:", table.concat(currentGame.enemyComp, ", "))
+    -- Emit match_end event
+    AppendEvent({ t = GetRelativeTime(), type = "match_end", winner = result })
 
-    local compressedLog = CompressGameLog()
+    -- Stop polling
+    if pollTicker then pollTicker:Cancel(); pollTicker = nil end
+    if snapshotTicker then snapshotTicker:Cancel(); snapshotTicker = nil end
 
+    -- Convert roster to friendlyTeam/enemyTeam arrays for UI compatibility
+    local friendlyTeam = {}
+    local enemyTeam = {}
+    local enemyComp = {}
+    local seenClass = {}
+    for guid, entry in pairs(currentMatch.roster) do
+        local p = {
+            name = entry.name,
+            class = entry.class,
+            race = entry.race,
+            spec = entry.spec,
+            ratingChange = entry.ratingChange,
+        }
+        if entry.team == "friendly" then
+            table.insert(friendlyTeam, p)
+        elseif entry.team == "enemy" then
+            table.insert(enemyTeam, p)
+            if entry.class and not seenClass[entry.class] then
+                table.insert(enemyComp, entry.class)
+                seenClass[entry.class] = true
+            end
+        end
+    end
+
+    -- Determine bracket from team size
+    local teamSize = math.max(#friendlyTeam, #enemyTeam)
+    local bracketNames = { [2] = "2v2", [3] = "3v3", [5] = "5v5" }
+    local bracket = bracketNames[teamSize]
+
+    -- Compress event log
+    local compressedEventLog = CompressEventLog()
+
+    -- Save to TrinketedHistoryDB
     table.insert(TrinketedHistoryDB.games, {
-        startTime = currentGame.startTime,
-        endTime = currentGame.endTime,
-        map = currentGame.map,
-        enemyComp = currentGame.enemyComp,
-        result = currentGame.result,
+        startTime = currentMatch.startTime,
+        endTime = currentMatch.endTime,
+        map = currentMatch.map,
+        enemyComp = enemyComp,
+        result = result,
         playerName = StripRealm(UnitName("player")),
-        friendlyTeam = currentGame.friendlyTeam,
-        enemyTeam = currentGame.enemyTeam,
-        bracket = currentGame.bracket,
-        ratingBefore = currentGame.ratingBefore,
-        ratingAfter = currentGame.ratingAfter,
-        ratingChange = currentGame.ratingChange,
-        gameLog = compressedLog,
+        friendlyTeam = friendlyTeam,
+        enemyTeam = enemyTeam,
+        bracket = bracket,
+        ratingBefore = currentMatch.ratingBefore,
+        ratingAfter = currentMatch.ratingAfter,
+        ratingChange = currentMatch.ratingChange,
+        eventLog = compressedEventLog,
     })
 
     -- Flush combat log between games
@@ -535,268 +1316,22 @@ local function SaveGame(result)
     UpdateOverlayVisibility()
 
     local count = #TrinketedHistoryDB.games
+    local eventCount = #currentMatch.events
     local ratingStr = ""
-    if currentGame.ratingChange then
-        local sign = currentGame.ratingChange >= 0 and "+" or ""
-        local color = currentGame.ratingChange >= 0 and "|cff00ff00" or "|cffff0000"
-        ratingStr = " " .. color .. "(" .. sign .. currentGame.ratingChange .. " rating, " ..
-            (currentGame.ratingBefore or "?") .. "→" .. (currentGame.ratingAfter or "?") .. ")|r"
+    if currentMatch.ratingChange then
+        local sign = currentMatch.ratingChange >= 0 and "+" or ""
+        local color = currentMatch.ratingChange >= 0 and "|cff00ff00" or "|cffff0000"
+        ratingStr = " " .. color .. "(" .. sign .. currentMatch.ratingChange .. " rating, " ..
+            (currentMatch.ratingBefore or "?") .. "→" .. (currentMatch.ratingAfter or "?") .. ")|r"
     end
-    print("|cff00ccff" .. DISPLAY_NAME .. ":|r Game #" .. count .. " recorded — " .. result .. ratingStr)
+    print("|cff00ccff" .. DISPLAY_NAME .. ":|r Game #" .. count .. " recorded — " .. result .. ratingStr ..
+        " | " .. eventCount .. " events | " .. string.format("%.1fs", currentMatch.duration))
 
     needsReload = true
 
-    ResetGameState()
+    ResetMatchState()
 end
 
-local function SnapshotEnemyTeam()
-    if not currentGame then return end
-    local seen = {}
-    for _, p in ipairs(currentGame.enemyTeam) do
-        seen[p.name] = true
-    end
-    -- Also maintain enemyComp for backward compat
-    local seenClass = {}
-    for _, class in ipairs(currentGame.enemyComp) do
-        seenClass[class] = true
-    end
-    for i = 1, 5 do
-        local unit = "arena" .. i
-        local name = StripRealm(UnitName(unit))
-        local _, className = UnitClass(unit)
-        if name and className then
-            local formatted = FormatClassName(className)
-            dbg("  " .. unit .. ":", name, formatted)
-            if not seen[name] then
-                local race = UnitRace(unit)
-                table.insert(currentGame.enemyTeam, { name = name, class = formatted, race = race })
-                seen[name] = true
-            end
-            if formatted and not seenClass[formatted] then
-                table.insert(currentGame.enemyComp, formatted)
-                seenClass[formatted] = true
-            end
-            -- Track GUID for combat log spec detection
-            local guid = UnitGUID(unit)
-            if guid then
-                local idx = #currentGame.enemyTeam
-                -- Find this player's index
-                for j, p in ipairs(currentGame.enemyTeam) do
-                    if p.name == name then idx = j; break end
-                end
-                guidToPlayer[guid] = { team = "enemy", index = idx }
-                dbg("  GUID mapped:", guid, "→ enemy[" .. idx .. "]", name)
-            end
-            -- Try GetArenaOpponentSpec API for immediate spec detection
-            if GetArenaOpponentSpec and GetSpecializationInfoByID then
-                local specID = GetArenaOpponentSpec(i)
-                if specID and specID > 0 then
-                    local _, specName = GetSpecializationInfoByID(specID)
-                    if specName then
-                        for j, p in ipairs(currentGame.enemyTeam) do
-                            if p.name == name and not p.spec then
-                                p.spec = specName
-                                dbg("  Spec via API:", name, "=", specName)
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-    dbg("SnapshotEnemyTeam() result:", #currentGame.enemyTeam, "players")
-end
-
-local function SnapshotFriendlyTeam()
-    if not currentGame then return end
-    local seen = {}
-    for _, p in ipairs(currentGame.friendlyTeam) do
-        seen[p.name] = true
-    end
-
-    -- Helper to track GUID after adding a player
-    local function trackGUID(unit, name)
-        local guid = UnitGUID(unit)
-        if guid and name then
-            for j, p in ipairs(currentGame.friendlyTeam) do
-                if p.name == name then
-                    guidToPlayer[guid] = { team = "friendly", index = j }
-                    dbg("  GUID mapped:", guid, "→ friendly[" .. j .. "]", name)
-                    break
-                end
-            end
-        end
-    end
-
-    -- Player themselves
-    local playerName = StripRealm(UnitName("player"))
-    local _, playerClass = UnitClass("player")
-    if playerName and playerClass and not seen[playerName] then
-        local race = UnitRace("player")
-        table.insert(currentGame.friendlyTeam, { name = playerName, class = FormatClassName(playerClass), race = race })
-        seen[playerName] = true
-    end
-    trackGUID("player", playerName)
-
-    -- Party members
-    for i = 1, 4 do
-        local unit = "party" .. i
-        local name = StripRealm(UnitName(unit))
-        local _, className = UnitClass(unit)
-        if name and className and not seen[name] then
-            local race = UnitRace(unit)
-            table.insert(currentGame.friendlyTeam, { name = name, class = FormatClassName(className), race = race })
-            seen[name] = true
-        end
-        trackGUID(unit, name)
-    end
-    dbg("SnapshotFriendlyTeam() result:", #currentGame.friendlyTeam, "players")
-end
-
--- Assign detected spec to a player entry (by GUID or by name+unit)
-local function AssignSpec(guid, spellName)
-    local specInfo = SPEC_SPELLS[spellName]
-    if not specInfo or not currentGame then return end
-
-    local ref = guidToPlayer[guid]
-    if not ref then return end
-
-    local team = (ref.team == "friendly") and currentGame.friendlyTeam or currentGame.enemyTeam
-    local player = team[ref.index]
-    if not player then return end
-
-    -- Validate class matches (e.g., don't assign Warrior spec to a Mage)
-    if player.class and player.class ~= specInfo.class then return end
-
-    if not player.spec then
-        player.spec = specInfo.spec
-        dbg("Spec detected:", player.name, "=", specInfo.spec, "(from", spellName .. ")")
-        print("|cff00ccff" .. DISPLAY_NAME .. ":|r Spec detected: " ..
-            "|c" .. (CLASS_COLORS[player.class] or "ffffffff") .. player.name .. "|r" ..
-            " = " .. specInfo.spec)
-    end
-end
-
--- Discover a player from a combat log GUID by checking arena/party units.
--- If found and not already tracked, adds them to the appropriate team.
-local function DiscoverPlayerByGUID(guid)
-    if not guid or not currentGame then return end
-    if guidToPlayer[guid] then return end  -- already known
-
-    -- Check enemy arena units
-    for i = 1, 5 do
-        local unit = "arena" .. i
-        local unitGUID = UnitGUID(unit)
-        if unitGUID == guid then
-            local name = StripRealm(UnitName(unit))
-            local _, className = UnitClass(unit)
-            if name and className then
-                local formatted = FormatClassName(className)
-                -- Check if already in enemy team by name
-                local found = false
-                for j, p in ipairs(currentGame.enemyTeam) do
-                    if p.name == name then
-                        -- Already have the player, just map the GUID
-                        guidToPlayer[guid] = { team = "enemy", index = j }
-                        dbg("GUID discovery: mapped existing enemy", name, "→ enemy[" .. j .. "]")
-                        found = true
-                        break
-                    end
-                end
-                if not found then
-                    local race = UnitRace(unit)
-                    table.insert(currentGame.enemyTeam, { name = name, class = formatted, race = race })
-                    local idx = #currentGame.enemyTeam
-                    guidToPlayer[guid] = { team = "enemy", index = idx }
-                    -- Also update enemyComp
-                    local seenClass = {}
-                    for _, c in ipairs(currentGame.enemyComp) do seenClass[c] = true end
-                    if formatted and not seenClass[formatted] then
-                        table.insert(currentGame.enemyComp, formatted)
-                    end
-                    dbg("GUID discovery: NEW enemy", name, formatted, "→ enemy[" .. idx .. "]")
-                    print("|cff00ccff" .. DISPLAY_NAME .. ":|r Discovered enemy: " ..
-                        "|c" .. (CLASS_COLORS[formatted] or "ffffffff") .. name .. "|r")
-                end
-                -- Try GetArenaOpponentSpec API
-                if GetArenaOpponentSpec and GetSpecializationInfoByID then
-                    local specID = GetArenaOpponentSpec(i)
-                    if specID and specID > 0 then
-                        local _, specName = GetSpecializationInfoByID(specID)
-                        if specName then
-                            for j, p in ipairs(currentGame.enemyTeam) do
-                                if p.name == name and not p.spec then
-                                    p.spec = specName
-                                    dbg("  Spec via API (discovery):", name, "=", specName)
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-            return
-        end
-    end
-
-    -- Check friendly party units (in case we missed someone)
-    local playerGUID = UnitGUID("player")
-    if guid == playerGUID then
-        local name = StripRealm(UnitName("player"))
-        if name then
-            for j, p in ipairs(currentGame.friendlyTeam) do
-                if p.name == name then
-                    guidToPlayer[guid] = { team = "friendly", index = j }
-                    dbg("GUID discovery: mapped player", name, "→ friendly[" .. j .. "]")
-                    return
-                end
-            end
-        end
-        return
-    end
-    for i = 1, 4 do
-        local unit = "party" .. i
-        local unitGUID = UnitGUID(unit)
-        if unitGUID == guid then
-            local name = StripRealm(UnitName(unit))
-            if name then
-                for j, p in ipairs(currentGame.friendlyTeam) do
-                    if p.name == name then
-                        guidToPlayer[guid] = { team = "friendly", index = j }
-                        dbg("GUID discovery: mapped party", name, "→ friendly[" .. j .. "]")
-                        return
-                    end
-                end
-            end
-            return
-        end
-    end
-end
-
--- Periodic re-snapshot: catches enemies who weren't visible at initial snapshot
--- (e.g., stealthed rogues who become arena1/arena2 units after unstealthing)
-local function StartSnapshotTicker()
-    if snapshotTicker then return end  -- already running
-    snapshotTicker = C_Timer.NewTicker(2, function()
-        if not inArena or not gameStarted or not currentGame then
-            -- Game ended or left arena, stop the ticker
-            if snapshotTicker then
-                snapshotTicker:Cancel()
-                snapshotTicker = nil
-            end
-            return
-        end
-        SnapshotEnemyTeam()
-    end)
-    dbg("Snapshot ticker started (every 2s)")
-end
-
-local function StopSnapshotTicker()
-    if snapshotTicker then
-        snapshotTicker:Cancel()
-        snapshotTicker = nil
-        dbg("Snapshot ticker stopped")
-    end
-end
 
 ---------------------------------------------------------------------------
 -- History Filters
@@ -1191,8 +1726,8 @@ local RefreshHistory
 local RefreshSessions
 local RefreshTeams
 
--- Refresh the active tab whenever the history content becomes visible
-historyContent:SetScript("OnShow", function()
+-- RefreshActiveTab is called from the contentFrame:OnShow hook (set in OnSelect)
+local function RefreshActiveTab()
     if activeTab == "sessions" then
         if RefreshSessions then RefreshSessions() end
     elseif activeTab == "teams" then
@@ -1200,7 +1735,7 @@ historyContent:SetScript("OnShow", function()
     elseif activeTab == "matches" then
         if RefreshHistory then RefreshHistory() end
     end
-end)
+end
 
 -- Tab container fills the content area
 local tabContainer = CreateFrame("Frame", nil, historyContent)
@@ -1706,12 +2241,12 @@ local headerY = -66
 local headers = {
     { text = "#",        x = 4,   w = 24, justify = "RIGHT" },
     { text = "Result",   x = 32,  w = 36, justify = "LEFT" },
-    { text = "Friendly", x = 68,  w = 210, justify = "LEFT" },
-    { text = "",         x = 282, w = 20, justify = "CENTER" },  -- vs column (no header)
-    { text = "Enemy",    x = 305, w = 210, justify = "LEFT" },
-    { text = "Rating",   x = 520, w = 95, justify = "CENTER" },
-    { text = "Dur",      x = 620, w = 45, justify = "LEFT" },
-    { text = "Time",     x = 670, w = 60, justify = "RIGHT" },
+    { text = "Friendly", x = 68,  w = 190, justify = "LEFT" },
+    { text = "",         x = 262, w = 20, justify = "CENTER" },  -- vs column (no header)
+    { text = "Enemy",    x = 285, w = 190, justify = "LEFT" },
+    { text = "Rating",   x = 480, w = 95, justify = "CENTER" },
+    { text = "Dur",      x = 580, w = 40, justify = "LEFT" },
+    { text = "Time",     x = 625, w = 105, justify = "RIGHT" },
 }
 for _, h in ipairs(headers) do
     if h.text ~= "" then
@@ -1916,7 +2451,7 @@ end
 
 local function FormatTime(ts)
     if not ts then return "?" end
-    return date("%H:%M:%S", ts)
+    return date("%m/%d %I:%M%p", ts):lower()
 end
 
 local function FormatTeam(team)
@@ -2009,7 +2544,7 @@ function RefreshHistory()
             row.friendly = row:CreateFontString(nil, "OVERLAY")
             row.friendly:SetFont(lib.FONT_BODY, 10, "")
             row.friendly:SetPoint("LEFT", 68, 0)
-            row.friendly:SetWidth(210)
+            row.friendly:SetWidth(190)
             row.friendly:SetJustifyH("LEFT")
             row.friendly:SetMaxLines(2)
             row.friendly:SetNonSpaceWrap(false)
@@ -2017,15 +2552,15 @@ function RefreshHistory()
 
             row.vs = row:CreateFontString(nil, "OVERLAY")
             row.vs:SetFont(lib.FONT_BODY, 10, "")
-            row.vs:SetPoint("LEFT", 282, 0)
+            row.vs:SetPoint("LEFT", 262, 0)
             row.vs:SetWidth(20)
             row.vs:SetJustifyH("CENTER")
             row.vs:SetTextColor(C.textMuted[1], C.textMuted[2], C.textMuted[3])
 
             row.enemy = row:CreateFontString(nil, "OVERLAY")
             row.enemy:SetFont(lib.FONT_BODY, 10, "")
-            row.enemy:SetPoint("LEFT", 305, 0)
-            row.enemy:SetWidth(210)
+            row.enemy:SetPoint("LEFT", 285, 0)
+            row.enemy:SetWidth(190)
             row.enemy:SetJustifyH("LEFT")
             row.enemy:SetMaxLines(2)
             row.enemy:SetNonSpaceWrap(false)
@@ -2033,20 +2568,20 @@ function RefreshHistory()
 
             row.rating = row:CreateFontString(nil, "OVERLAY")
             row.rating:SetFont(lib.FONT_BODY, 10, "")
-            row.rating:SetPoint("LEFT", 520, 0)
+            row.rating:SetPoint("LEFT", 480, 0)
             row.rating:SetWidth(95)
             row.rating:SetJustifyH("CENTER")
 
             row.duration = row:CreateFontString(nil, "OVERLAY")
             row.duration:SetFont(lib.FONT_BODY, 10, "")
-            row.duration:SetPoint("LEFT", 620, 0)
-            row.duration:SetWidth(45)
+            row.duration:SetPoint("LEFT", 580, 0)
+            row.duration:SetWidth(40)
             row.duration:SetJustifyH("CENTER")
 
             row.timeStr = row:CreateFontString(nil, "OVERLAY")
             row.timeStr:SetFont(lib.FONT_BODY, 10, "")
-            row.timeStr:SetPoint("LEFT", 670, 0)
-            row.timeStr:SetWidth(60)
+            row.timeStr:SetPoint("LEFT", 625, 0)
+            row.timeStr:SetWidth(105)
             row.timeStr:SetJustifyH("RIGHT")
 
             row.replayBtn = CreateFrame("Button", nil, row)
@@ -2130,7 +2665,7 @@ function RefreshHistory()
         row.timeStr:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
 
         -- Replay button
-        if game.gameLog then
+        if game.eventLog then
             row.replayBtn:Show()
             row.replayBtn:SetScript("OnClick", function()
                 addon:OpenReplay(game)
@@ -2584,12 +3119,12 @@ function RefreshSessions()
                 hrow.isHeader = true
                 local drillHeaders = {
                     { text = "Result",   x = 32,  w = 36,  justify = "LEFT" },
-                    { text = "Friendly", x = 68,  w = 210, justify = "LEFT" },
-                    { text = "",         x = 282, w = 20,  justify = "CENTER" },
-                    { text = "Enemy",    x = 305, w = 210, justify = "LEFT" },
-                    { text = "Rating",   x = 520, w = 95,  justify = "CENTER" },
-                    { text = "Dur",      x = 620, w = 45,  justify = "LEFT" },
-                    { text = "Time",     x = 670, w = 60,  justify = "RIGHT" },
+                    { text = "Friendly", x = 68,  w = 190, justify = "LEFT" },
+                    { text = "",         x = 262, w = 20,  justify = "CENTER" },
+                    { text = "Enemy",    x = 285, w = 190, justify = "LEFT" },
+                    { text = "Rating",   x = 480, w = 95,  justify = "CENTER" },
+                    { text = "Dur",      x = 580, w = 40,  justify = "LEFT" },
+                    { text = "Time",     x = 625, w = 105, justify = "RIGHT" },
                 }
                 for _, dh in ipairs(drillHeaders) do
                     if dh.text ~= "" then
@@ -2622,7 +3157,7 @@ function RefreshSessions()
                     mrow.friendly = mrow:CreateFontString(nil, "OVERLAY")
                     mrow.friendly:SetFont(lib.FONT_BODY, 10, "")
                     mrow.friendly:SetPoint("LEFT", 68, 0)
-                    mrow.friendly:SetWidth(210)
+                    mrow.friendly:SetWidth(190)
                     mrow.friendly:SetJustifyH("LEFT")
                     mrow.friendly:SetMaxLines(2)
                     mrow.friendly:SetNonSpaceWrap(false)
@@ -2630,15 +3165,15 @@ function RefreshSessions()
 
                     mrow.vs = mrow:CreateFontString(nil, "OVERLAY")
                     mrow.vs:SetFont(lib.FONT_BODY, 10, "")
-                    mrow.vs:SetPoint("LEFT", 282, 0)
+                    mrow.vs:SetPoint("LEFT", 262, 0)
                     mrow.vs:SetWidth(20)
                     mrow.vs:SetJustifyH("CENTER")
                     mrow.vs:SetTextColor(C.textMuted[1], C.textMuted[2], C.textMuted[3])
 
                     mrow.enemy = mrow:CreateFontString(nil, "OVERLAY")
                     mrow.enemy:SetFont(lib.FONT_BODY, 10, "")
-                    mrow.enemy:SetPoint("LEFT", 305, 0)
-                    mrow.enemy:SetWidth(210)
+                    mrow.enemy:SetPoint("LEFT", 285, 0)
+                    mrow.enemy:SetWidth(190)
                     mrow.enemy:SetJustifyH("LEFT")
                     mrow.enemy:SetMaxLines(2)
                     mrow.enemy:SetNonSpaceWrap(false)
@@ -2646,20 +3181,20 @@ function RefreshSessions()
 
                     mrow.rating = mrow:CreateFontString(nil, "OVERLAY")
                     mrow.rating:SetFont(lib.FONT_BODY, 10, "")
-                    mrow.rating:SetPoint("LEFT", 520, 0)
+                    mrow.rating:SetPoint("LEFT", 480, 0)
                     mrow.rating:SetWidth(95)
                     mrow.rating:SetJustifyH("CENTER")
 
                     mrow.duration = mrow:CreateFontString(nil, "OVERLAY")
                     mrow.duration:SetFont(lib.FONT_BODY, 10, "")
-                    mrow.duration:SetPoint("LEFT", 620, 0)
-                    mrow.duration:SetWidth(45)
+                    mrow.duration:SetPoint("LEFT", 580, 0)
+                    mrow.duration:SetWidth(40)
                     mrow.duration:SetJustifyH("CENTER")
 
                     mrow.timeStr = mrow:CreateFontString(nil, "OVERLAY")
                     mrow.timeStr:SetFont(lib.FONT_BODY, 10, "")
-                    mrow.timeStr:SetPoint("LEFT", 670, 0)
-                    mrow.timeStr:SetWidth(60)
+                    mrow.timeStr:SetPoint("LEFT", 625, 0)
+                    mrow.timeStr:SetWidth(105)
                     mrow.timeStr:SetJustifyH("RIGHT")
 
                     mrow.bg = mrow:CreateTexture(nil, "BACKGROUND")
@@ -3106,27 +3641,28 @@ local function TableToJSON(val)
     return "null"
 end
 
-function CompressGameLog()
-    if not currentGame or not currentGame.gameLog then return nil end
-    local log = currentGame.gameLog
-    local container = {
-        v = 1,
-        initialState = log.initialState,
-        events = log.events,
-        eventCount = #log.events,
+CompressEventLog = function()
+    if not currentMatch or not currentMatch.events then return nil end
+
+    local log = {
+        v = 3,
+        startTime = currentMatch.startTime,
+        roster = currentMatch.roster,
+        events = currentMatch.events,
     }
-    local json = TableToJSON(container)
+
+    local json = TableToJSON(log)
     local compressed = LibDeflate:CompressZlib(json, { level = 9 })
     if not compressed then
-        dbg("CompressGameLog: compression failed")
+        dbg("CompressEventLog: compression failed")
         return nil
     end
     local encoded = LibDeflate:EncodeForPrint(compressed)
     if not encoded then
-        dbg("CompressGameLog: encoding failed")
+        dbg("CompressEventLog: encoding failed")
         return nil
     end
-    dbg("CompressGameLog:", #log.events, "events,", #json, "bytes JSON →", #encoded, "bytes encoded")
+    dbg("CompressEventLog:", #log.events, "events,", #json, "bytes JSON →", #encoded, "bytes encoded")
     return encoded
 end
 
@@ -3221,18 +3757,7 @@ local function ExportHistory()
     if not TrinketedHistoryDB or not TrinketedHistoryDB.games or #TrinketedHistoryDB.games == 0 then
         return nil, "No games to export."
     end
-    -- Strip gameLog from exported games to keep exports lightweight
-    local strippedGames = {}
-    for i, game in ipairs(TrinketedHistoryDB.games) do
-        local copy = {}
-        for k, v in pairs(game) do
-            if k ~= "gameLog" then
-                copy[k] = v
-            end
-        end
-        strippedGames[i] = copy
-    end
-    local data = { v = 1, t = time(), g = strippedGames }
+    local data = { v = 1, t = time(), g = TrinketedHistoryDB.games }
     local json = TableToJSON(data)
     local compressed = LibDeflate:CompressZlib(json, { level = 9 })
     if not compressed then return nil, "Compression failed." end
@@ -3405,8 +3930,15 @@ frame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
 frame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 frame:RegisterEvent("PVP_RATED_STATS_UPDATE")
 frame:RegisterEvent("UPDATE_BATTLEFIELD_SCORE")
+frame:RegisterEvent("UNIT_TARGET")
+frame:RegisterEvent("PLAYER_FOCUS_CHANGED")
+frame:RegisterEvent("ARENA_COOLDOWNS_UPDATE")
+frame:RegisterEvent("LOSS_OF_CONTROL_ADDED")
 
 frame:SetScript("OnEvent", function(self, event, ...)
+    -----------------------------------------------------------------
+    -- ADDON_LOADED
+    -----------------------------------------------------------------
     if event == "ADDON_LOADED" then
         local loadedAddon = ...
         if loadedAddon == ADDON_NAME then
@@ -3414,9 +3946,6 @@ frame:SetScript("OnEvent", function(self, event, ...)
             TrinketedHistoryDB.games = TrinketedHistoryDB.games or {}
             TrinketedHistoryDB.minimap = TrinketedHistoryDB.minimap or { minimapPos = 220, hide = false }
             TrinketedHistoryDB.settings = TrinketedHistoryDB.settings or { showTimestamp = true }
-            if TrinketedHistoryDB.settings.enableGameLog == nil then
-                TrinketedHistoryDB.settings.enableGameLog = false
-            end
 
             -- Migrate data from old TrinketedDB.games if TrinketedHistoryDB is empty
             if #TrinketedHistoryDB.games == 0 and TrinketedDB and TrinketedDB.games and #TrinketedDB.games > 0 then
@@ -3438,9 +3967,8 @@ frame:SetScript("OnEvent", function(self, event, ...)
             end
 
             -- Ensure advanced combat logging is enabled
-            if GetCVar("advancedCombatLogging") ~= "1" then
-                SetCVar("advancedCombatLogging", 1)
-                print("|cff00ccff" .. DISPLAY_NAME .. ":|r Enabled advanced combat logging.")
+            if SetCVar then
+                SetCVar("advancedCombatLogging", "1")
             end
 
             print("|cff00ccff" .. DISPLAY_NAME .. ":|r Loaded. " .. #TrinketedHistoryDB.games .. " games on record.")
@@ -3448,103 +3976,100 @@ frame:SetScript("OnEvent", function(self, event, ...)
             -- Recover state if we reloaded mid-arena
             local zone = GetRealZoneText()
             if ARENA_ZONES[zone] then
-                inArena = true
-                LoggingCombat(true)
-                ResetGameState()
+                if state == "IDLE" then
+                    state = "IN_ARENA_PREP"
+                    InitMatch()
+                    currentMatch.map = zone
+                    LoggingCombat(true)
 
-                -- Check if gates already opened (no prep buff = game in progress)
-                local hasBuff = HasPrepBuff()
-                if hasBuff then
-                    -- Still in prep room
-                    hadPrepBuff = true
-                    dbg("Reload recovery: in prep room")
-                    print("|cff00ccff" .. DISPLAY_NAME .. ":|r Reload detected — in arena prep room.")
-                else
-                    -- Gates already opened, game is in progress
-                    gameStarted = true
-                    currentGame.startTime = time() -- approximate, we lost the real start time
-                    dbg("Reload recovery: game in progress")
-                    print("|cff00ccff" .. DISPLAY_NAME .. ":|r Reload detected — arena game in progress. Resuming tracking (start time approximated).")
-                end
-                UpdateOverlayVisibility()
-
-                -- Re-snapshot teams and rebuild GUID tracking
-                SnapshotFriendlyTeam()
-                SnapshotEnemyTeam()
-                if gameStarted then
-                    StartSnapshotTicker()
-                    InitGameLog()
+                    -- Check if gates already opened (no prep buff = game in progress)
+                    local hasBuff = HasPrepBuff()
+                    if hasBuff then
+                        hadPrepBuff = true
+                        dbg("Reload recovery: in prep room")
+                        print("|cff00ccff" .. DISPLAY_NAME .. ":|r Reload detected — in arena prep room.")
+                    else
+                        -- Gates already opened, game is in progress
+                        StartRecording()
+                        dbg("Reload recovery: game in progress")
+                        print("|cff00ccff" .. DISPLAY_NAME .. ":|r Reload detected — arena game in progress. Resuming tracking.")
+                    end
+                    UpdateOverlayVisibility()
                 end
             end
         end
 
+    -----------------------------------------------------------------
+    -- ZONE_CHANGED_NEW_AREA
+    -----------------------------------------------------------------
     elseif event == "ZONE_CHANGED_NEW_AREA" then
         local zone = GetRealZoneText()
-        dbg("ZONE_CHANGED_NEW_AREA:", zone, "| isArena:", tostring(ARENA_ZONES[zone] ~= nil))
+        dbg("ZONE_CHANGED_NEW_AREA:", zone)
+
         if ARENA_ZONES[zone] then
-            if not inArena then
-                inArena = true
-                LoggingCombat(true)
-                ResetGameState()
-                -- Request fresh rating data so GetPersonalRatedInfo is up to date
+            if state == "IDLE" then
+                state = "IN_ARENA_PREP"
+                InitMatch()
+                currentMatch.map = zone
+
+                -- Request fresh rating data
                 if RequestRatedInfo then RequestRatedInfo() end
-                print("|cff00ccff" .. DISPLAY_NAME .. ":|r Entered arena — combat log started.")
+
+                -- Enable advanced combat logging
+                if SetCVar then
+                    SetCVar("advancedCombatLogging", "1")
+                end
+                LoggingCombat(true)
+
+                print("|cff00ccff" .. DISPLAY_NAME .. ":|r Entered " .. zone .. " — waiting for gates...")
             end
         else
-            if inArena then
-                -- Left arena zone while game in progress = LOSS
-                if gameStarted and currentGame and currentGame.startTime then
-                    SaveGame("LOSS")
-                end
-                StopSnapshotTicker()
-                inArena = false
-                gameStarted = false
-                LoggingCombat(false)
-                UpdateOverlayVisibility()
-                print("|cff00ccff" .. DISPLAY_NAME .. ":|r Left arena — combat log stopped.")
+            if state == "RECORDING" then
+                -- Left arena during match = LOSS
+                SaveMatch("LOSS")
+            elseif state == "IN_ARENA_PREP" then
+                ResetMatchState()
             end
+            LoggingCombat(false)
+            UpdateOverlayVisibility()
         end
 
+    -----------------------------------------------------------------
+    -- UNIT_AURA — gates open detection
+    -----------------------------------------------------------------
     elseif event == "UNIT_AURA" then
         local unit = ...
-        if unit ~= "player" or not inArena or gameStarted then return end
+        if unit ~= "player" then return end
+        if state ~= "IN_ARENA_PREP" then return end
 
         local hasBuff = HasPrepBuff()
-        dbg("UNIT_AURA player: hasPrepBuff:", tostring(hasBuff), "hadPrepBuff:", tostring(hadPrepBuff))
         if hasBuff then
-            hadPrepBuff = true
-            UpdateOverlayVisibility()
+            if not hadPrepBuff then
+                hadPrepBuff = true
+                dbg("Arena Preparation buff detected")
+                UpdateOverlayVisibility()
+            end
         elseif hadPrepBuff and not hasBuff then
             -- Prep buff was removed = gates opened
-            gameStarted = true
-            currentGame.startTime = time()
-            -- Snapshot all bracket ratings before the game
-            currentGame.ratingsBefore = SnapshotAllRatings()
-            dbg("Pre-game ratings snapshot:",
-                currentGame.ratingsBefore and currentGame.ratingsBefore[1] or "nil",
-                currentGame.ratingsBefore and currentGame.ratingsBefore[2] or "nil",
-                currentGame.ratingsBefore and currentGame.ratingsBefore[3] or "nil")
-            UpdateOverlayVisibility()
-            SnapshotFriendlyTeam()
-            SnapshotEnemyTeam()
-            StartSnapshotTicker()
-            InitGameLog()
-            dbg("Game started! startTime:", currentGame.startTime)
-            print("|cff00ccff" .. DISPLAY_NAME .. ":|r Gates open — game started.")
+            StartRecording()
         end
 
+    -----------------------------------------------------------------
+    -- ARENA_OPPONENT_UPDATE
+    -----------------------------------------------------------------
     elseif event == "ARENA_OPPONENT_UPDATE" then
-        dbg("ARENA_OPPONENT_UPDATE | inArena:", tostring(inArena))
-        if inArena then
-            SnapshotEnemyTeam()
-            SnapshotFriendlyTeam()
+        if state == "IN_ARENA_PREP" or state == "RECORDING" then
+            SnapshotRoster()
         end
 
+    -----------------------------------------------------------------
+    -- UPDATE_BATTLEFIELD_STATUS — match end detection
+    -----------------------------------------------------------------
     elseif event == "UPDATE_BATTLEFIELD_STATUS" then
         UpdateOverlayVisibility()
 
         -- Check if we just queued and have unsaved data — reload to persist
-        if needsReload and not inArena then
+        if needsReload and state == "IDLE" then
             for i = 1, GetMaxBattlefieldID() do
                 local status = GetBattlefieldStatus(i)
                 if status == "queued" then
@@ -3556,119 +4081,159 @@ frame:SetScript("OnEvent", function(self, event, ...)
             end
         end
 
+        if state ~= "RECORDING" then return end
+
         local winner = GetBattlefieldWinner()
-        dbg("UPDATE_BATTLEFIELD_STATUS | inArena:", tostring(inArena), "gameStarted:", tostring(gameStarted), "winner:", tostring(winner))
-        if not inArena or not gameStarted then return end
+        if not winner then return end
 
-        if winner then
-            local playerFaction = GetBattlefieldArenaFaction()
-            dbg("  winner:", winner, "playerFaction:", playerFaction)
-            local matchResult = (winner == playerFaction) and "WIN" or "LOSS"
-            pendingSave = matchResult
-            -- Request fresh rating + scoreboard data
-            if RequestRatedInfo then RequestRatedInfo() end
-            if RequestBattlefieldScoreData then RequestBattlefieldScoreData() end
-            -- Fallback timer: save after 2s if UPDATE_BATTLEFIELD_SCORE hasn't fired yet
-            C_Timer.After(2, function()
-                if pendingSave and currentGame and currentGame.startTime then
-                    dbg("Fallback timer: saving game (scoreboard event didn't fire)")
-                    SaveGame(pendingSave)
-                    pendingSave = nil
-                end
-            end)
-        end
+        local playerFaction = GetBattlefieldArenaFaction()
+        local matchResult = (winner == playerFaction) and "WIN" or "LOSS"
+        pendingSave = matchResult
 
+        dbg("UPDATE_BATTLEFIELD_STATUS: winner =", winner, "playerFaction =", playerFaction, "→", matchResult)
+
+        -- Request fresh data then save
+        if RequestRatedInfo then RequestRatedInfo() end
+        if RequestBattlefieldScoreData then RequestBattlefieldScoreData() end
+
+        -- Fallback: save after 2s if UPDATE_BATTLEFIELD_SCORE doesn't fire
+        C_Timer.After(2, function()
+            if pendingSave and currentMatch and currentMatch.startTime then
+                dbg("Fallback save timer fired")
+                SaveMatch(pendingSave)
+                pendingSave = nil
+            end
+        end)
+
+    -----------------------------------------------------------------
+    -- UPDATE_BATTLEFIELD_SCORE — best time to save (scoreboard ready)
+    -----------------------------------------------------------------
+    elseif event == "UPDATE_BATTLEFIELD_SCORE" then
+        if not pendingSave then return end
+
+        if RequestRatedInfo then RequestRatedInfo() end
+        C_Timer.After(0.5, function()
+            if pendingSave and currentMatch and currentMatch.startTime then
+                dbg("Saving from UPDATE_BATTLEFIELD_SCORE")
+                SaveMatch(pendingSave)
+                pendingSave = nil
+            end
+        end)
+
+    -----------------------------------------------------------------
+    -- COMBAT_LOG_EVENT_UNFILTERED
+    -----------------------------------------------------------------
     elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
-        if not inArena or not gameStarted then return end
-        RecordCLEUEvent()
-        local _, eventType, _, sourceGUID, _, _, _, destGUID, _, _, _, spellID, spellName = CombatLogGetCurrentEventInfo()
+        OnCLEU()
 
-        -- Try to discover unknown GUIDs from arena/party units
-        if sourceGUID and not guidToPlayer[sourceGUID] then
-            DiscoverPlayerByGUID(sourceGUID)
-        end
-        if destGUID and destGUID ~= sourceGUID and not guidToPlayer[destGUID] then
-            DiscoverPlayerByGUID(destGUID)
-        end
-
-        -- Now try spec detection on the source
-        if sourceGUID and spellName and SPEC_SPELLS[spellName] and guidToPlayer[sourceGUID] then
-            AssignSpec(sourceGUID, spellName)
-        end
-
+    -----------------------------------------------------------------
+    -- UNIT_SPELLCAST_SUCCEEDED — spec detection + friendly trinket
+    -----------------------------------------------------------------
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
-        if not inArena or not gameStarted then return end
+        if state ~= "RECORDING" then return end
         local unit, _, spellID = ...
         if not unit or not spellID then return end
         local guid = UnitGUID(unit)
         if not guid then return end
-        -- Try to discover if unknown
-        if not guidToPlayer[guid] then
-            DiscoverPlayerByGUID(guid)
-        end
-        if not guidToPlayer[guid] then return end
+
+        if not relevantGUIDs[guid] then DiscoverPlayerByGUID(guid) end
+        if not relevantGUIDs[guid] then return end
+
         local spellName = GetSpellInfo(spellID)
         if spellName and SPEC_SPELLS[spellName] then
             AssignSpec(guid, spellName)
         end
 
-        -- Record UNIT_SPELLCAST_SUCCEEDED into gameLog (deduplicate by GUID+spellID)
-        if currentGame and currentGame.gameLog then
-            local events = currentGame.gameLog.events
-            -- Skip duplicate: same GUID+spellID as last USC event
-            local lastEvt = events[#events]
-            if lastEvt and lastEvt[2] == "UNIT_SPELLCAST_SUCCEEDED"
-                and lastEvt[4] == guid and lastEvt[12] == spellID then
-                return
-            end
-            if #events < MAX_LOG_EVENTS then
-                local unitName = StripRealm(UnitName(unit))
-                local epochNow = math.floor((tsBaseEpoch + (GetTime() - tsBaseGetTime)) * 1000 + 0.5) / 1000
-                local srcFlags = UnitIsFriend("player", unit) and 0x511 or 0x548
-                events[#events + 1] = {
-                    epochNow,                       -- [1] timestamp
-                    "UNIT_SPELLCAST_SUCCEEDED",     -- [2] event type
-                    false,                          -- [3] hideCaster
-                    guid,                           -- [4] srcGUID
-                    unitName or "",                 -- [5] srcName
-                    srcFlags,                       -- [6] srcFlags
-                    0,                              -- [7] srcRaidFlags
-                    guid,                           -- [8] destGUID
-                    unitName or "",                 -- [9] destName
-                    srcFlags,                       -- [10] destFlags
-                    0,                              -- [11] destRaidFlags
-                    spellID,                        -- [12] spellId
-                    spellName or "",                -- [13] spellName
-                    0x1,                            -- [14] spellSchool
-                }
-            end
-        end
-
-    elseif event == "PVP_RATED_STATS_UPDATE" then
-        -- Rating data refreshed — update pre-game snapshot if we haven't captured it yet
-        if inArena and currentGame and not currentGame.ratingsBefore then
-            currentGame.ratingsBefore = SnapshotAllRatings()
-            dbg("Pre-game ratings (async):",
-                currentGame.ratingsBefore and currentGame.ratingsBefore[1] or "nil",
-                currentGame.ratingsBefore and currentGame.ratingsBefore[2] or "nil",
-                currentGame.ratingsBefore and currentGame.ratingsBefore[3] or "nil")
-        end
-
-    elseif event == "UPDATE_BATTLEFIELD_SCORE" then
-        dbg("UPDATE_BATTLEFIELD_SCORE fired | pendingSave:", tostring(pendingSave))
-        -- Scoreboard is now available — this is the best time to save
-        if pendingSave and currentGame and currentGame.startTime then
-            -- Request fresh personal rating, then save after a brief delay
-            -- to let PVP_RATED_STATS_UPDATE arrive
-            if RequestRatedInfo then RequestRatedInfo() end
-            C_Timer.After(0.5, function()
-                if pendingSave and currentGame and currentGame.startTime then
-                    dbg("Saving game from UPDATE_BATTLEFIELD_SCORE")
-                    SaveGame(pendingSave)
-                    pendingSave = nil
+        -- Friendly trinket/CC-break detection via SPELL_DB
+        if SPELL_DB then
+            local dbEntry = SPELL_DB[spellID]
+            if dbEntry then
+                local cat = dbEntry.cat
+                if cat == "trinket" or cat == "cc_break" or cat == "racial" then
+                    local name = UnitName(unit)
+                    if name then name = StripRealm(name) end
+                    local sn = GetSpellInfo(spellID) or dbEntry.name or "?"
+                    local evt = {
+                        t = GetRelativeTime(), type = "cast_success",
+                        src = name or "?", srcGUID = guid,
+                        dst = name or "?", dstGUID = guid,
+                        spellID = spellID, spell = sn,
+                        cat = cat,
+                    }
+                    EnrichEvent(evt)
+                    AppendEvent(evt)
                 end
-            end)
+            end
         end
+
+    -----------------------------------------------------------------
+    -- PVP_RATED_STATS_UPDATE
+    -----------------------------------------------------------------
+    elseif event == "PVP_RATED_STATS_UPDATE" then
+        if state == "IN_ARENA_PREP" and not ratingsBefore then
+            ratingsBefore = SnapshotAllRatings()
+            dbg("Pre-match ratings (async):", ratingsBefore and ratingsBefore[1], ratingsBefore and ratingsBefore[2])
+        end
+
+    -----------------------------------------------------------------
+    -- UNIT_TARGET
+    -----------------------------------------------------------------
+    elseif event == "UNIT_TARGET" then
+        local unit = ...
+        if unit then OnUnitTarget(unit) end
+
+    -----------------------------------------------------------------
+    -- PLAYER_FOCUS_CHANGED
+    -----------------------------------------------------------------
+    elseif event == "PLAYER_FOCUS_CHANGED" then
+        OnFocusChanged()
+
+    -----------------------------------------------------------------
+    -- ARENA_COOLDOWNS_UPDATE — PvP trinket detection
+    -----------------------------------------------------------------
+    elseif event == "ARENA_COOLDOWNS_UPDATE" then
+        if not C_PvP or not C_PvP.GetArenaCrowdControlInfo then return end
+
+        for i = 1, 5 do
+            local unitID = "arena" .. i
+            local spellID, itemID, startTime, duration = C_PvP.GetArenaCrowdControlInfo(unitID)
+            if spellID and startTime and startTime ~= 0 and duration and duration ~= 0 then
+                if state ~= "RECORDING" or not currentMatch then
+                    -- skip: not recording
+                else
+                    local guid = UnitGUID(unitID)
+                    if guid and not relevantGUIDs[guid] then
+                        DiscoverPlayerByGUID(guid)
+                    end
+                    if guid then
+                        if trinketLastStart[guid] ~= startTime then
+                            trinketLastStart[guid] = startTime
+                            local t = GetRelativeTime()
+                            local name = UnitName(unitID)
+                            if name then name = StripRealm(name) end
+                            local spellName = GetSpellInfo(spellID) or "PvP Trinket"
+                            local evt = {
+                                t = t, type = "cast_success",
+                                src = name or "?", srcGUID = guid,
+                                dst = name or "?", dstGUID = guid,
+                                spellID = spellID, spell = spellName,
+                                cat = "trinket",
+                            }
+                            EnrichEvent(evt)
+                            if not evt.cat then evt.cat = "trinket" end
+                            AppendEvent(evt)
+                            dbg("RECORDED trinket from", name, spellID)
+                        end
+                    end
+                end
+            end
+        end
+
+    -----------------------------------------------------------------
+    -- LOSS_OF_CONTROL_ADDED
+    -----------------------------------------------------------------
+    elseif event == "LOSS_OF_CONTROL_ADDED" then
+        OnLossOfControl()
     end
 end)
 
@@ -3724,45 +4289,25 @@ local function RegisterSubCommands()
     lib:RegisterSubCommand("status", function()
         print("|cff00ccff" .. DISPLAY_NAME .. ":|r State dump:")
         print("  combatLogging:", tostring(LoggingCombat()))
-        print("  inArena:", tostring(inArena))
-        print("  gameStarted:", tostring(gameStarted))
+        print("  state:", state)
         print("  hadPrepBuff:", tostring(hadPrepBuff))
-        if currentGame then
-            print("  startTime:", tostring(currentGame.startTime))
-            print("  enemyComp:", table.concat(currentGame.enemyComp, ", "))
-            print("  friendlyTeam:", #currentGame.friendlyTeam, "players")
-            for j, p in ipairs(currentGame.friendlyTeam) do
-                local color = CLASS_COLORS[p.class] or "ffffffff"
-                print("    [" .. j .. "] |c" .. color .. p.name .. "|r - " .. (p.class or "?") .. " / " .. (p.spec or "no spec"))
+        if currentMatch then
+            print("  startTime:", tostring(currentMatch.startTime))
+            local rosterCount = 0
+            for _ in pairs(currentMatch.roster) do rosterCount = rosterCount + 1 end
+            print("  roster:", rosterCount, "players")
+            for guid, entry in pairs(currentMatch.roster) do
+                local color = CLASS_COLORS[entry.class] or "ffffffff"
+                print("    |c" .. color .. (entry.name or "?") .. "|r - " .. (entry.class or "?") .. " / " .. (entry.spec or "no spec") .. " (" .. entry.team .. ")")
             end
-            print("  enemyTeam:", #currentGame.enemyTeam, "players")
-            for j, p in ipairs(currentGame.enemyTeam) do
-                local color = CLASS_COLORS[p.class] or "ffffffff"
-                print("    [" .. j .. "] |c" .. color .. p.name .. "|r - " .. (p.class or "?") .. " / " .. (p.spec or "no spec"))
-            end
-            if currentGame.ratingsBefore then
-                print("  ratingsBefore: 2v2=" .. tostring(currentGame.ratingsBefore[1]) ..
-                    " 3v3=" .. tostring(currentGame.ratingsBefore[2]) ..
-                    " 5v5=" .. tostring(currentGame.ratingsBefore[3]))
+            if ratingsBefore then
+                print("  ratingsBefore: 2v2=" .. tostring(ratingsBefore[1]) ..
+                    " 3v3=" .. tostring(ratingsBefore[2]) ..
+                    " 5v5=" .. tostring(ratingsBefore[3]))
             else
                 print("  ratingsBefore: not captured")
             end
-            print("  bracket:", tostring(currentGame.bracket))
-            print("  ratingBefore:", tostring(currentGame.ratingBefore))
-            print("  ratingAfter:", tostring(currentGame.ratingAfter))
-            print("  ratingChange:", tostring(currentGame.ratingChange))
-            for j, p in ipairs(currentGame.friendlyTeam) do
-                if p.ratingChange then
-                    local color = CLASS_COLORS[p.class] or "ffffffff"
-                    print("    friendly[" .. j .. "] |c" .. color .. p.name .. "|r ratingChange=" .. tostring(p.ratingChange))
-                end
-            end
-            for j, p in ipairs(currentGame.enemyTeam) do
-                if p.ratingChange then
-                    local color = CLASS_COLORS[p.class] or "ffffffff"
-                    print("    enemy[" .. j .. "] |c" .. color .. p.name .. "|r ratingChange=" .. tostring(p.ratingChange))
-                end
-            end
+            print("  events:", currentMatch.events and #currentMatch.events or 0)
         end
         print("  debugMode:", tostring(debugMode))
         print("  GetPersonalRatedInfo:", tostring(GetPersonalRatedInfo ~= nil))
@@ -3824,7 +4369,7 @@ local function RegisterSubCommands()
                 end
             end
         end
-        if inArena and GetArenaOpponentSpec then
+        if state ~= "IDLE" and GetArenaOpponentSpec then
             local numSpecs = GetNumArenaOpponentSpecs and GetNumArenaOpponentSpecs() or 0
             print("  numArenaOpponentSpecs:", numSpecs)
             for i = 1, 5 do
@@ -3857,7 +4402,7 @@ local function RegisterSubCommands()
                 debugLog = nil
                 return
             end
-            -- Compress using the same pipeline as CompressGameLog
+            -- Compress debug log
             local container = {
                 v = 1,
                 initialState = debugLog.initialState,
@@ -3887,7 +4432,7 @@ local function RegisterSubCommands()
                 friendlyTeam = {},
                 enemyTeam = {},
                 enemyComp = {},
-                gameLog = encoded,
+                debugLog = encoded,
             }
             TrinketedHistoryDB.debugLog = entry
             print("|cffE8B923Trinketed:|r Saved to TrinketedHistoryDB.debugLog. /reload to flush to disk.")
@@ -4104,9 +4649,10 @@ local function RegisterSubCommands()
             end
         end)
 
-        -- Register for CLEU + UNIT_SPELLCAST_SUCCEEDED
+        -- Register for CLEU + UNIT_SPELLCAST_SUCCEEDED + arena trinket API
         cleuFrame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
         cleuFrame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
+        cleuFrame:RegisterEvent("ARENA_COOLDOWNS_UPDATE")
         cleuFrame:SetScript("OnEvent", function(_, event, ...)
             if not cleuFrame:IsShown() then return end
 
@@ -4122,6 +4668,29 @@ local function RegisterSubCommands()
                     end
                     AddLine("|cff44ff44" .. event .. "|r  " .. tostring(unit) ..
                         "  |cffcccccc" .. tostring(spellID) .. ", " .. spellName .. "|r")
+                end
+                return
+            end
+
+            if event == "ARENA_COOLDOWNS_UPDATE" then
+                if C_PvP and C_PvP.GetArenaCrowdControlInfo then
+                    for i = 1, 5 do
+                        local unitID = "arena" .. i
+                        local spellID, itemID, startTime, duration = C_PvP.GetArenaCrowdControlInfo(unitID)
+                        if spellID and startTime and startTime ~= 0 and duration and duration ~= 0 then
+                            local name = UnitName(unitID) or unitID
+                            local spellName = ""
+                            if C_Spell and C_Spell.GetSpellInfo then
+                                local info = C_Spell.GetSpellInfo(spellID)
+                                spellName = info and info.name or ""
+                            elseif GetSpellInfo then
+                                spellName = GetSpellInfo(spellID) or ""
+                            end
+                            AddLine("|cffF6C86BARENA_COOLDOWNS|r  " .. name ..
+                                "  |cffcccccc" .. tostring(spellID) .. ", " .. spellName ..
+                                "  start=" .. tostring(startTime) .. " dur=" .. tostring(duration) .. "|r")
+                        end
+                    end
                 end
                 return
             end
@@ -4183,26 +4752,18 @@ lib:RegisterSubAddon("History", {
                     UpdateOverlayVisibility()
                 end)
 
-            y = y - 30
-            y = lib:CreateSectionHeader(settingsContainer, y, "GAME LOGGING")
-
-            lib:CreateCheckbox(settingsContainer, 20, y, "Record combat events for replay",
-                TrinketedHistoryDB.settings.enableGameLog, function(isOn)
-                    TrinketedHistoryDB.settings.enableGameLog = isOn
-                end)
-
-            local note = settingsContainer:CreateFontString(nil, "OVERLAY")
-            note:SetFont(lib.FONT_BODY, 11, "")
-            note:SetPoint("TOPLEFT", 44, y - 22)
-            note:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
-            note:SetText("Captures all combat log events during arena matches.\nAdds ~200-400KB per game to saved data.")
         end
 
         -- Embed the history content directly in the options panel
         historyContent:SetParent(contentFrame)
         historyContent:ClearAllPoints()
         historyContent:SetAllPoints(contentFrame)
-        historyContent:Show()
+
+        -- Refresh data every time the content frame is shown (tab selected or panel re-opened)
+        contentFrame:HookScript("OnShow", function()
+            historyContent:Show()
+            RefreshActiveTab()
+        end)
     end,
 })
 
