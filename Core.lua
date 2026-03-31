@@ -742,12 +742,17 @@ local function OnCLEU()
 
     elseif subevent == "SPELL_CAST_SUCCESS" then
         local spellID, spellName = info[12], info[13]
-        event = {
-            t = t, type = "cast_success",
-            src = StripRealm(srcName), srcGUID = srcGUID,
-            dst = StripRealm(dstName), dstGUID = dstGUID,
-            spellID = spellID, spell = spellName,
-        }
+        -- Skip trinket/cc_break/racial — handled by UNIT_SPELLCAST_SUCCEEDED / ARENA_COOLDOWNS_UPDATE
+        local dbEntry = spellID and SPELL_DB and SPELL_DB[spellID]
+        local skipCat = dbEntry and dbEntry.cat
+        if skipCat ~= "trinket" and skipCat ~= "cc_break" and skipCat ~= "racial" then
+            event = {
+                t = t, type = "cast_success",
+                src = StripRealm(srcName), srcGUID = srcGUID,
+                dst = StripRealm(dstName), dstGUID = dstGUID,
+                spellID = spellID, spell = spellName,
+            }
+        end
 
     elseif subevent == "SPELL_CAST_FAILED" then
         local spellID, spellName = info[12], info[13]
@@ -2239,14 +2244,15 @@ end)
 -- Column headers
 local headerY = -66
 local headers = {
-    { text = "#",        x = 4,   w = 24, justify = "RIGHT" },
-    { text = "Result",   x = 32,  w = 36, justify = "LEFT" },
-    { text = "Friendly", x = 68,  w = 190, justify = "LEFT" },
-    { text = "",         x = 262, w = 20, justify = "CENTER" },  -- vs column (no header)
-    { text = "Enemy",    x = 285, w = 190, justify = "LEFT" },
-    { text = "Rating",   x = 480, w = 95, justify = "CENTER" },
-    { text = "Dur",      x = 580, w = 40, justify = "LEFT" },
-    { text = "Time",     x = 625, w = 105, justify = "RIGHT" },
+    { text = "#",        x = 4,   w = 20, justify = "RIGHT" },
+    { text = "Result",   x = 26,  w = 32, justify = "LEFT" },
+    { text = "Friendly", x = 58,  w = 170, justify = "LEFT" },
+    { text = "",         x = 230, w = 14, justify = "CENTER" },  -- vs column (no header)
+    { text = "Enemy",    x = 246, w = 170, justify = "LEFT" },
+    { text = "Rating",   x = 420, w = 90, justify = "CENTER" },
+    { text = "Dur",      x = 514, w = 36, justify = "LEFT" },
+    { text = "Time",     x = 554, w = 95, justify = "RIGHT" },
+    { text = "",         x = 654, w = 55, justify = "CENTER" },
 }
 for _, h in ipairs(headers) do
     if h.text ~= "" then
@@ -2533,18 +2539,18 @@ function RefreshHistory()
             row.index = row:CreateFontString(nil, "OVERLAY")
             row.index:SetFont(lib.FONT_BODY, 10, "")
             row.index:SetPoint("LEFT", 4, 0)
-            row.index:SetWidth(24)
+            row.index:SetWidth(20)
             row.index:SetJustifyH("RIGHT")
 
             row.result = row:CreateFontString(nil, "OVERLAY")
             row.result:SetFont(lib.FONT_BODY, 10, "")
-            row.result:SetPoint("LEFT", 32, 0)
+            row.result:SetPoint("LEFT", 26, 0)
             row.result:SetWidth(32)
 
             row.friendly = row:CreateFontString(nil, "OVERLAY")
             row.friendly:SetFont(lib.FONT_BODY, 10, "")
-            row.friendly:SetPoint("LEFT", 68, 0)
-            row.friendly:SetWidth(190)
+            row.friendly:SetPoint("LEFT", 58, 0)
+            row.friendly:SetWidth(170)
             row.friendly:SetJustifyH("LEFT")
             row.friendly:SetMaxLines(2)
             row.friendly:SetNonSpaceWrap(false)
@@ -2552,15 +2558,15 @@ function RefreshHistory()
 
             row.vs = row:CreateFontString(nil, "OVERLAY")
             row.vs:SetFont(lib.FONT_BODY, 10, "")
-            row.vs:SetPoint("LEFT", 262, 0)
-            row.vs:SetWidth(20)
+            row.vs:SetPoint("LEFT", 230, 0)
+            row.vs:SetWidth(14)
             row.vs:SetJustifyH("CENTER")
             row.vs:SetTextColor(C.textMuted[1], C.textMuted[2], C.textMuted[3])
 
             row.enemy = row:CreateFontString(nil, "OVERLAY")
             row.enemy:SetFont(lib.FONT_BODY, 10, "")
-            row.enemy:SetPoint("LEFT", 285, 0)
-            row.enemy:SetWidth(190)
+            row.enemy:SetPoint("LEFT", 246, 0)
+            row.enemy:SetWidth(170)
             row.enemy:SetJustifyH("LEFT")
             row.enemy:SetMaxLines(2)
             row.enemy:SetNonSpaceWrap(false)
@@ -2568,35 +2574,43 @@ function RefreshHistory()
 
             row.rating = row:CreateFontString(nil, "OVERLAY")
             row.rating:SetFont(lib.FONT_BODY, 10, "")
-            row.rating:SetPoint("LEFT", 480, 0)
-            row.rating:SetWidth(95)
+            row.rating:SetPoint("LEFT", 420, 0)
+            row.rating:SetWidth(90)
             row.rating:SetJustifyH("CENTER")
 
             row.duration = row:CreateFontString(nil, "OVERLAY")
             row.duration:SetFont(lib.FONT_BODY, 10, "")
-            row.duration:SetPoint("LEFT", 580, 0)
-            row.duration:SetWidth(40)
+            row.duration:SetPoint("LEFT", 514, 0)
+            row.duration:SetWidth(36)
             row.duration:SetJustifyH("CENTER")
 
             row.timeStr = row:CreateFontString(nil, "OVERLAY")
             row.timeStr:SetFont(lib.FONT_BODY, 10, "")
-            row.timeStr:SetPoint("LEFT", 625, 0)
-            row.timeStr:SetWidth(105)
+            row.timeStr:SetPoint("LEFT", 554, 0)
+            row.timeStr:SetWidth(95)
             row.timeStr:SetJustifyH("RIGHT")
 
             row.replayBtn = CreateFrame("Button", nil, row)
-            row.replayBtn:SetSize(16, 16)
-            row.replayBtn:SetPoint("RIGHT", -4, 0)
+            row.replayBtn:SetSize(50, 18)
+            row.replayBtn:SetPoint("LEFT", 654, 0)
+            row.replayBtn.bg = row.replayBtn:CreateTexture(nil, "BACKGROUND")
+            row.replayBtn.bg:SetAllPoints()
+            row.replayBtn.bg:SetColorTexture(C.accent[1], C.accent[2], C.accent[3], 0.15)
+            row.replayBtn.bdr = row.replayBtn:CreateTexture(nil, "BORDER")
+            row.replayBtn.bdr:SetPoint("TOPLEFT"); row.replayBtn.bdr:SetPoint("BOTTOMRIGHT")
+            row.replayBtn.bdr:SetColorTexture(0, 0, 0, 0)
             row.replayBtn.icon = row.replayBtn:CreateFontString(nil, "OVERLAY")
-            row.replayBtn.icon:SetFont(lib.FONT_MONO, 10, "")
+            row.replayBtn.icon:SetFont(lib.FONT_BODY, 9, "")
             row.replayBtn.icon:SetPoint("CENTER")
-            row.replayBtn.icon:SetText(">")
+            row.replayBtn.icon:SetText("Replay >")
             row.replayBtn.icon:SetTextColor(C.accent[1], C.accent[2], C.accent[3])
             row.replayBtn:SetScript("OnEnter", function(self)
-                lib:ShowMicroTip(self, "Open replay", "TOP", 0, 4)
+                self.bg:SetColorTexture(C.accent[1], C.accent[2], C.accent[3], 0.3)
+                self.icon:SetTextColor(1, 1, 1)
             end)
-            row.replayBtn:SetScript("OnLeave", function()
-                lib:HideMicroTip()
+            row.replayBtn:SetScript("OnLeave", function(self)
+                self.bg:SetColorTexture(C.accent[1], C.accent[2], C.accent[3], 0.15)
+                self.icon:SetTextColor(C.accent[1], C.accent[2], C.accent[3])
             end)
 
             -- Alternating background
@@ -2668,6 +2682,7 @@ function RefreshHistory()
         if game.eventLog then
             row.replayBtn:Show()
             row.replayBtn:SetScript("OnClick", function()
+                lib:HideOptionsPanel()
                 addon:OpenReplay(game)
             end)
         else
@@ -3118,13 +3133,13 @@ function RefreshSessions()
             if not hrow.isHeader then
                 hrow.isHeader = true
                 local drillHeaders = {
-                    { text = "Result",   x = 32,  w = 36,  justify = "LEFT" },
-                    { text = "Friendly", x = 68,  w = 190, justify = "LEFT" },
-                    { text = "",         x = 262, w = 20,  justify = "CENTER" },
-                    { text = "Enemy",    x = 285, w = 190, justify = "LEFT" },
-                    { text = "Rating",   x = 480, w = 95,  justify = "CENTER" },
-                    { text = "Dur",      x = 580, w = 40,  justify = "LEFT" },
-                    { text = "Time",     x = 625, w = 105, justify = "RIGHT" },
+                    { text = "Result",   x = 26,  w = 32,  justify = "LEFT" },
+                    { text = "Friendly", x = 58,  w = 170, justify = "LEFT" },
+                    { text = "",         x = 230, w = 14,  justify = "CENTER" },
+                    { text = "Enemy",    x = 246, w = 170, justify = "LEFT" },
+                    { text = "Rating",   x = 420, w = 90,  justify = "CENTER" },
+                    { text = "Dur",      x = 514, w = 36,  justify = "LEFT" },
+                    { text = "Time",     x = 554, w = 95,  justify = "RIGHT" },
                 }
                 for _, dh in ipairs(drillHeaders) do
                     if dh.text ~= "" then
@@ -3151,13 +3166,13 @@ function RefreshSessions()
 
                     mrow.result = mrow:CreateFontString(nil, "OVERLAY")
                     mrow.result:SetFont(lib.FONT_BODY, 10, "")
-                    mrow.result:SetPoint("LEFT", 32, 0)
+                    mrow.result:SetPoint("LEFT", 26, 0)
                     mrow.result:SetWidth(32)
 
                     mrow.friendly = mrow:CreateFontString(nil, "OVERLAY")
                     mrow.friendly:SetFont(lib.FONT_BODY, 10, "")
-                    mrow.friendly:SetPoint("LEFT", 68, 0)
-                    mrow.friendly:SetWidth(190)
+                    mrow.friendly:SetPoint("LEFT", 58, 0)
+                    mrow.friendly:SetWidth(170)
                     mrow.friendly:SetJustifyH("LEFT")
                     mrow.friendly:SetMaxLines(2)
                     mrow.friendly:SetNonSpaceWrap(false)
@@ -3165,15 +3180,15 @@ function RefreshSessions()
 
                     mrow.vs = mrow:CreateFontString(nil, "OVERLAY")
                     mrow.vs:SetFont(lib.FONT_BODY, 10, "")
-                    mrow.vs:SetPoint("LEFT", 262, 0)
-                    mrow.vs:SetWidth(20)
+                    mrow.vs:SetPoint("LEFT", 230, 0)
+                    mrow.vs:SetWidth(14)
                     mrow.vs:SetJustifyH("CENTER")
                     mrow.vs:SetTextColor(C.textMuted[1], C.textMuted[2], C.textMuted[3])
 
                     mrow.enemy = mrow:CreateFontString(nil, "OVERLAY")
                     mrow.enemy:SetFont(lib.FONT_BODY, 10, "")
-                    mrow.enemy:SetPoint("LEFT", 285, 0)
-                    mrow.enemy:SetWidth(190)
+                    mrow.enemy:SetPoint("LEFT", 246, 0)
+                    mrow.enemy:SetWidth(170)
                     mrow.enemy:SetJustifyH("LEFT")
                     mrow.enemy:SetMaxLines(2)
                     mrow.enemy:SetNonSpaceWrap(false)
@@ -3181,20 +3196,20 @@ function RefreshSessions()
 
                     mrow.rating = mrow:CreateFontString(nil, "OVERLAY")
                     mrow.rating:SetFont(lib.FONT_BODY, 10, "")
-                    mrow.rating:SetPoint("LEFT", 480, 0)
-                    mrow.rating:SetWidth(95)
+                    mrow.rating:SetPoint("LEFT", 420, 0)
+                    mrow.rating:SetWidth(90)
                     mrow.rating:SetJustifyH("CENTER")
 
                     mrow.duration = mrow:CreateFontString(nil, "OVERLAY")
                     mrow.duration:SetFont(lib.FONT_BODY, 10, "")
-                    mrow.duration:SetPoint("LEFT", 580, 0)
-                    mrow.duration:SetWidth(40)
+                    mrow.duration:SetPoint("LEFT", 514, 0)
+                    mrow.duration:SetWidth(36)
                     mrow.duration:SetJustifyH("CENTER")
 
                     mrow.timeStr = mrow:CreateFontString(nil, "OVERLAY")
                     mrow.timeStr:SetFont(lib.FONT_BODY, 10, "")
-                    mrow.timeStr:SetPoint("LEFT", 625, 0)
-                    mrow.timeStr:SetWidth(105)
+                    mrow.timeStr:SetPoint("LEFT", 554, 0)
+                    mrow.timeStr:SetWidth(95)
                     mrow.timeStr:SetJustifyH("RIGHT")
 
                     mrow.bg = mrow:CreateTexture(nil, "BACKGROUND")
@@ -3946,6 +3961,7 @@ frame:SetScript("OnEvent", function(self, event, ...)
             TrinketedHistoryDB.games = TrinketedHistoryDB.games or {}
             TrinketedHistoryDB.minimap = TrinketedHistoryDB.minimap or { minimapPos = 220, hide = false }
             TrinketedHistoryDB.settings = TrinketedHistoryDB.settings or { showTimestamp = true }
+            TrinketedHistoryDB.settings.hiddenReplayCDs = TrinketedHistoryDB.settings.hiddenReplayCDs or {}
 
             -- Migrate data from old TrinketedDB.games if TrinketedHistoryDB is empty
             if #TrinketedHistoryDB.games == 0 and TrinketedDB and TrinketedDB.games and #TrinketedDB.games > 0 then
@@ -4145,7 +4161,8 @@ frame:SetScript("OnEvent", function(self, event, ...)
         end
 
         -- Friendly trinket/CC-break detection via SPELL_DB
-        if SPELL_DB then
+        -- Only for player/party units — arena opponents are handled by ARENA_COOLDOWNS_UPDATE
+        if SPELL_DB and not unit:match("^arena") then
             local dbEntry = SPELL_DB[spellID]
             if dbEntry then
                 local cat = dbEntry.cat

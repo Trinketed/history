@@ -7,23 +7,24 @@ local addon = TrinketedHistory
 
 local lib = LibStub("TrinketedLib-1.0")
 local C = lib.C
-local REPLAY_SPELLS = addon.REPLAY_SPELLS
-
 local replayFrame = nil
 local session = nil
 
 -- Layout constants
-local FRAME_W, FRAME_H = 950, 560
-local UNIT_PANEL_W = 600
-local FEED_PANEL_W = 330
-local TRANSPORT_H = 40
-local UNIT_FRAME_W = 270
-local UNIT_FRAME_H = 55
-local HP_BAR_H = 12
-local POWER_BAR_H = 6
+local FRAME_W, FRAME_H = 1100, 560
+local UNIT_PANEL_W = 580
+local FEED_PANEL_W = 500
+local TRANSPORT_H = 52
+local UNIT_FRAME_W = 200
+local UNIT_FRAME_H = 34
+local HP_BAR_H = 10
+local POWER_BAR_H = 5
 local ICON_SIZE = 16
-local ICON_GAP = 2
-local FEED_ROW_H = 18
+local ICON_GAP = 1
+local CD_ICON_SIZE = 20
+local CD_ICON_GAP = 1
+local FEED_ROW_H = 20
+local FEED_ICON_SIZE = 14
 
 local SPEEDS = { 0.5, 1, 2, 4 }
 local speedIndex = 2  -- default 1x
@@ -74,17 +75,23 @@ end
 -- Category colors for feed and markers
 ---------------------------------------------------------------------------
 local CAT_COLORS = {
-    cc        = { r = 0.3, g = 0.6, b = 1.0 },
-    damage    = { r = 1.0, g = 0.3, b = 0.3 },
-    healing   = { r = 0.3, g = 1.0, b = 0.3 },
-    death     = { r = 1.0, g = 0.1, b = 0.1 },
-    defensive = { r = 0.91, g = 0.73, b = 0.14 },
-    offensive = { r = 1.0, g = 0.5, b = 0.1 },
-    trinket   = { r = 0.91, g = 0.73, b = 0.14 },
-    aura      = { r = 0.6, g = 0.4, b = 0.8 },
-    cast      = { r = 0.7, g = 0.7, b = 0.7 },
-    power     = { r = 0.3, g = 0.5, b = 0.8 },
-    other     = { r = 0.5, g = 0.5, b = 0.5 },
+    damage       = { r = 1.0, g = 0.3, b = 0.3 },
+    healing      = { r = 0.3, g = 1.0, b = 0.3 },
+    death        = { r = 1.0, g = 0.1, b = 0.1 },
+    offensive_cd = { r = 1.0, g = 0.5, b = 0.1 },
+    defensive_cd = { r = 0.91, g = 0.73, b = 0.14 },
+    interrupt    = { r = 1.0, g = 0.3, b = 0.2 },
+    trinket      = { r = 1.0, g = 0.2, b = 0.8 },
+    racial       = { r = 0.91, g = 0.73, b = 0.14 },
+    cc_break     = { r = 0.91, g = 0.73, b = 0.14 },
+    healing_cd   = { r = 0.3, g = 1.0, b = 0.3 },
+    mobility     = { r = 0.3, g = 0.6, b = 1.0 },
+    dispel       = { r = 0.66, g = 0.33, b = 0.97 },
+    utility      = { r = 0.5, g = 0.5, b = 0.5 },
+    aura         = { r = 0.6, g = 0.4, b = 0.8 },
+    cast         = { r = 0.7, g = 0.7, b = 0.7 },
+    miss         = { r = 0.5, g = 0.5, b = 0.5 },
+    power        = { r = 0.3, g = 0.5, b = 0.8 },
 }
 
 ---------------------------------------------------------------------------
@@ -140,12 +147,7 @@ local function CreateUnitFrame(parent, yOffset)
     f.powerBar:SetHeight(POWER_BAR_H)
     f.powerBar:SetColorTexture(0, 0, 1, 1)
 
-    -- Icon row container (for auras/cooldowns)
-    f.iconRow = CreateFrame("Frame", nil, f)
-    f.iconRow:SetPoint("TOPLEFT", f.powerBarBg, "BOTTOMLEFT", 0, -2)
-    f.iconRow:SetSize(UNIT_FRAME_W - 6, ICON_SIZE)
-
-    f.icons = {}   -- pool of icon frames
+    f.icons = {}   -- pool of CD icon frames (positioned externally)
 
     -- State tracking for lerp
     f.targetHealth = 0
@@ -228,92 +230,159 @@ local function UpdateUnitFrame(uf, playerState, currentTime, seeking)
         uf.powerBar:Hide()
     end
 
-    -- Icons: auras + cooldowns
-    local iconIdx = 0
-
-    -- Active auras
-    for spellName, aura in pairs(playerState.auras) do
-        iconIdx = iconIdx + 1
-        local icon = uf.icons[iconIdx]
-        if not icon then
-            icon = CreateFrame("Frame", nil, uf.iconRow)
-            icon:SetSize(ICON_SIZE, ICON_SIZE)
-            icon.tex = icon:CreateTexture(nil, "ARTWORK")
-            icon.tex:SetAllPoints()
-            icon.border = icon:CreateTexture(nil, "BACKGROUND")
-            icon.border:SetPoint("TOPLEFT", -1, 1)
-            icon.border:SetPoint("BOTTOMRIGHT", 1, -1)
-            icon.border:SetColorTexture(1, 0, 0, 1)
-            icon.cooldown = CreateFrame("Cooldown", nil, icon, "CooldownFrameTemplate")
-            icon.cooldown:SetAllPoints()
-            icon.cooldown:SetDrawEdge(false)
-            uf.icons[iconIdx] = icon
-        end
-        icon:SetPoint("TOPLEFT", (iconIdx - 1) * (ICON_SIZE + ICON_GAP), 0)
-        -- Icon texture
-        local texID = aura.spellID and GetSpellTexture(aura.spellID)
-        if texID then
-            icon.tex:SetTexture(texID)
-            icon.tex:SetDesaturated(false)
-        else
-            icon.tex:SetColorTexture(0.3, 0.3, 0.3, 1)
-        end
-        -- Border color: red for debuff, green for buff
-        if aura.isDebuff then
-            icon.border:SetColorTexture(1, 0, 0, 0.8)
-        else
-            icon.border:SetColorTexture(0, 1, 0, 0.8)
-        end
-        -- Duration sweep
-        if aura.duration and aura.applied then
-            icon.cooldown:SetCooldown(GetTime() - (currentTime - aura.applied), aura.duration)
-            icon.cooldown:Show()
-        else
-            icon.cooldown:Hide()
-        end
-        icon:Show()
-    end
-
-    -- Active cooldowns
-    for spellName, cd in pairs(playerState.cooldowns) do
-        if cd.cast then
-            local cdDur = cd.duration or 3  -- show instant CDs (trinket etc.) for 3s
-            local elapsed = currentTime - cd.cast
-            if elapsed < cdDur then
-                iconIdx = iconIdx + 1
-                local icon = uf.icons[iconIdx]
+    -- Cooldown tracker: show all class CDs to the right of the unit frame
+    local hiddenCDs = TrinketedHistoryDB and TrinketedHistoryDB.settings and TrinketedHistoryDB.settings.hiddenReplayCDs or {}
+    local classCDs = playerState.class and addon.CLASS_COOLDOWNS and addon.CLASS_COOLDOWNS[playerState.class]
+    local visIdx = 0
+    if classCDs then
+        for idx, spellID in ipairs(classCDs) do
+            -- Skip hidden spells
+            if hiddenCDs[spellID] then
+                -- ensure pooled icon is hidden
+                if uf.icons[idx] then uf.icons[idx]:Hide() end
+            else
+                visIdx = visIdx + 1
+                local icon = uf.icons[idx]
                 if not icon then
-                    icon = CreateFrame("Frame", nil, uf.iconRow)
-                    icon:SetSize(ICON_SIZE, ICON_SIZE)
+                    icon = CreateFrame("Frame", nil, uf:GetParent())
+                    icon:SetSize(CD_ICON_SIZE, CD_ICON_SIZE)
+                    icon.bgTex = icon:CreateTexture(nil, "BACKGROUND")
+                    icon.bgTex:SetPoint("TOPLEFT", -1, 1)
+                    icon.bgTex:SetPoint("BOTTOMRIGHT", 1, -1)
+                    icon.bgTex:SetColorTexture(0.04, 0.04, 0.05, 1)
+                    icon.bdrT = icon:CreateTexture(nil, "BORDER")
+                    icon.bdrT:SetPoint("TOPLEFT", -1, 1); icon.bdrT:SetPoint("TOPRIGHT", 1, 1); icon.bdrT:SetHeight(1)
+                    icon.bdrB = icon:CreateTexture(nil, "BORDER")
+                    icon.bdrB:SetPoint("BOTTOMLEFT", -1, -1); icon.bdrB:SetPoint("BOTTOMRIGHT", 1, -1); icon.bdrB:SetHeight(1)
+                    icon.bdrL = icon:CreateTexture(nil, "BORDER")
+                    icon.bdrL:SetPoint("TOPLEFT", -1, 1); icon.bdrL:SetPoint("BOTTOMLEFT", -1, -1); icon.bdrL:SetWidth(1)
+                    icon.bdrR = icon:CreateTexture(nil, "BORDER")
+                    icon.bdrR:SetPoint("TOPRIGHT", 1, 1); icon.bdrR:SetPoint("BOTTOMRIGHT", 1, -1); icon.bdrR:SetWidth(1)
                     icon.tex = icon:CreateTexture(nil, "ARTWORK")
                     icon.tex:SetAllPoints()
-                    icon.border = icon:CreateTexture(nil, "BACKGROUND")
-                    icon.border:SetPoint("TOPLEFT", -1, 1)
-                    icon.border:SetPoint("BOTTOMRIGHT", 1, -1)
+                    icon.tex:SetTexCoord(0.08, 0.92, 0.08, 0.92)
                     icon.cooldown = CreateFrame("Cooldown", nil, icon, "CooldownFrameTemplate")
                     icon.cooldown:SetAllPoints()
-                    icon.cooldown:SetDrawEdge(false)
-                    uf.icons[iconIdx] = icon
+                    icon.cooldown:SetDrawEdge(true)
+                    icon.cooldown:SetDrawBling(false)
+                    icon.cooldown:SetSwipeColor(0, 0, 0, 0.5)
+                    icon.cooldown:SetHideCountdownNumbers(false)
+                    icon.tipBtn = CreateFrame("Button", nil, icon)
+                    icon.tipBtn:SetAllPoints()
+                    icon.tipBtn:SetFrameLevel(icon.cooldown:GetFrameLevel() + 1)
+                    icon.tipBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+                    uf.icons[idx] = icon
                 end
-                icon:SetPoint("TOPLEFT", (iconIdx - 1) * (ICON_SIZE + ICON_GAP), 0)
-                local texID = cd.spellID and GetSpellTexture(cd.spellID)
-                if texID then
-                    icon.tex:SetTexture(texID)
-                    icon.tex:SetDesaturated(true)
+
+                -- Position using visible index
+                local col = (visIdx - 1) % 11
+                local row = math.floor((visIdx - 1) / 11)
+                icon:ClearAllPoints()
+                icon:SetPoint("TOPLEFT", uf, "TOPRIGHT", 4 + col * (CD_ICON_SIZE + CD_ICON_GAP), -(row * (CD_ICON_SIZE + CD_ICON_GAP)))
+
+                -- Spell texture — faction-specific for PvP Trinket, fallback via name
+                if spellID == 42292 then
+                    local faction = UnitFactionGroup(playerState.team == "friendly" and "player" or "arena1")
+                    if faction == "Alliance" then
+                        icon.tex:SetTexture("Interface\\Icons\\INV_Jewelry_TrinketPVP_01")
+                    else
+                        icon.tex:SetTexture("Interface\\Icons\\INV_Jewelry_TrinketPVP_02")
+                    end
                 else
-                    icon.tex:SetColorTexture(0.2, 0.2, 0.2, 1)
+                    local texID = GetSpellTexture(spellID)
+                    if not texID then
+                        -- Fallback: try via spell name from SPELL_DB
+                        local dbEntry = SPELL_DB and SPELL_DB[spellID]
+                        if dbEntry and dbEntry.name then
+                            texID = GetSpellTexture(dbEntry.name)
+                        end
+                    end
+                    if texID then
+                        icon.tex:SetTexture(texID)
+                    else
+                        icon.tex:SetTexture("Interface\\Icons\\INV_Misc_QuestionMark")
+                    end
                 end
-                icon.border:SetColorTexture(C.textDim[1], C.textDim[2], C.textDim[3], 0.8)
-                icon.cooldown:SetCooldown(GetTime() - elapsed, cdDur)
-                icon.cooldown:Show()
+
+                -- Tooltip on hover + right-click to hide
+                local thisSpellID = spellID
+                local dbEntry = SPELL_DB and SPELL_DB[spellID]
+                local spellName = dbEntry and dbEntry.name or ""
+                icon.tipBtn:SetScript("OnEnter", function(self)
+                    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                    GameTooltip:SetSpellByID(thisSpellID)
+                    GameTooltip:AddLine("|cff888888Right-click to hide|r")
+                    GameTooltip:Show()
+                end)
+                icon.tipBtn:SetScript("OnLeave", function()
+                    GameTooltip:Hide()
+                end)
+                icon.tipBtn:SetScript("OnClick", function(self, button)
+                    if button == "RightButton" then
+                        if TrinketedHistoryDB and TrinketedHistoryDB.settings then
+                            TrinketedHistoryDB.settings.hiddenReplayCDs[thisSpellID] = true
+                        end
+                        print("|cff00ccff" .. "Trinketed" .. ":|r Hidden " .. (spellName ~= "" and spellName or ("spell " .. thisSpellID)) .. " from replay CD tracker. Use the gear menu to re-enable.")
+                    end
+                end)
+
+                -- Category border color
+                local cat = dbEntry and dbEntry.cat or ""
+                local br, bg, bb
+                if cat == "trinket" or cat == "racial" or cat == "cc_break" then
+                    br, bg, bb = 0.91, 0.73, 0.14
+                elseif cat == "offensive_cd" then
+                    br, bg, bb = 1.0, 0.2, 0.2
+                elseif cat == "defensive_cd" then
+                    br, bg, bb = 0.2, 0.8, 0.2
+                elseif cat == "interrupt" then
+                    br, bg, bb = 1.0, 0.5, 0.0
+                elseif cat == "healing_cd" then
+                    br, bg, bb = 0.2, 0.8, 0.2
+                else
+                    br, bg, bb = 0.3, 0.3, 0.3
+                end
+
+                -- Check if on cooldown
+                local cd = playerState.cooldowns and playerState.cooldowns[spellID]
+                if cd then
+                    local elapsed = currentTime - cd.castTime
+                    if elapsed < cd.cd then
+                        icon.tex:SetDesaturated(true)
+                        icon.cooldown:SetCooldown(GetTime() - elapsed, cd.cd)
+                        icon.cooldown:Show()
+                        icon.bdrT:SetColorTexture(br, bg, bb, 0.3)
+                        icon.bdrB:SetColorTexture(br, bg, bb, 0.3)
+                        icon.bdrL:SetColorTexture(br, bg, bb, 0.3)
+                        icon.bdrR:SetColorTexture(br, bg, bb, 0.3)
+                    else
+                        icon.tex:SetDesaturated(false)
+                        icon.cooldown:Hide()
+                        icon.bdrT:SetColorTexture(br, bg, bb, 1)
+                        icon.bdrB:SetColorTexture(br, bg, bb, 1)
+                        icon.bdrL:SetColorTexture(br, bg, bb, 1)
+                        icon.bdrR:SetColorTexture(br, bg, bb, 1)
+                    end
+                else
+                    icon.tex:SetDesaturated(false)
+                    icon.cooldown:Hide()
+                    icon.bdrT:SetColorTexture(br, bg, bb, 1)
+                    icon.bdrB:SetColorTexture(br, bg, bb, 1)
+                    icon.bdrL:SetColorTexture(br, bg, bb, 1)
+                    icon.bdrR:SetColorTexture(br, bg, bb, 1)
+                end
+
                 icon:Show()
             end
         end
-    end
-
-    -- Hide unused icons
-    for i = iconIdx + 1, #uf.icons do
-        uf.icons[i]:Hide()
+        -- Hide excess pool entries
+        for i = #classCDs + 1, #uf.icons do
+            if uf.icons[i] then uf.icons[i]:Hide() end
+        end
+    else
+        for i = 1, #uf.icons do
+            if uf.icons[i] then uf.icons[i]:Hide() end
+        end
     end
 end
 
@@ -326,7 +395,7 @@ local function CreateReplayFrame()
     local frame = lib:CreateWindowFrame("TrinketedReplayFrame", {
         width = FRAME_W,
         height = FRAME_H,
-        title = "Replay",
+        title = "|cffE8B923T|r|cffF4F4F5RINKETED|r Replay",
         onClose = function()
             if session then
                 session:Destroy()
@@ -334,6 +403,112 @@ local function CreateReplayFrame()
             end
         end,
     })
+    frame:SetScript("OnDragStart", nil)
+    frame:SetScript("OnDragStop", nil)
+    frame:RegisterForDrag()
+
+    -- ===== GEAR MENU (tracked spells config) =====
+    local gearBtn = CreateFrame("Button", nil, frame)
+    gearBtn:SetSize(20, 20)
+    gearBtn:SetPoint("TOPRIGHT", -28, -6)
+    gearBtn.icon = gearBtn:CreateFontString(nil, "OVERLAY")
+    gearBtn.icon:SetFont(lib.FONT_MONO, 14, "")
+    gearBtn.icon:SetPoint("CENTER")
+    gearBtn.icon:SetText("*")
+    gearBtn.icon:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
+    gearBtn:SetScript("OnEnter", function(self)
+        self.icon:SetTextColor(C.accent[1], C.accent[2], C.accent[3])
+        GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+        GameTooltip:SetText("Tracked Spells")
+        GameTooltip:AddLine("Configure which cooldowns to show", 0.6, 0.6, 0.6)
+        GameTooltip:Show()
+    end)
+    gearBtn:SetScript("OnLeave", function(self)
+        self.icon:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
+        GameTooltip:Hide()
+    end)
+
+    -- Dropdown menu for tracked spells
+    local menuFrame = CreateFrame("Frame", "TrinketedReplayCDMenu", UIParent, "UIDropDownMenuTemplate")
+
+    local CLASS_ORDER = { "Warrior", "Paladin", "Hunter", "Rogue", "Priest",
+        "Mage", "Warlock", "Shaman", "Druid" }
+
+    local function InitCDMenu(self, level, menuList)
+        local info = UIDropDownMenu_CreateInfo()
+        local hiddenCDs = TrinketedHistoryDB and TrinketedHistoryDB.settings and TrinketedHistoryDB.settings.hiddenReplayCDs or {}
+
+        if level == 1 then
+            -- Show All / Reset option
+            info.text = "|cff00ff00Show All (Reset)|r"
+            info.notCheckable = true
+            info.func = function()
+                if TrinketedHistoryDB and TrinketedHistoryDB.settings then
+                    wipe(TrinketedHistoryDB.settings.hiddenReplayCDs)
+                end
+                print("|cff00ccffTrinketed:|r All replay CD tracker spells restored.")
+                CloseDropDownMenus()
+            end
+            UIDropDownMenu_AddButton(info, level)
+
+            -- Separator
+            info = UIDropDownMenu_CreateInfo()
+            info.text = ""
+            info.isTitle = true
+            info.notCheckable = true
+            UIDropDownMenu_AddButton(info, level)
+
+            -- Class submenus
+            for _, className in ipairs(CLASS_ORDER) do
+                local spells = addon.CLASS_COOLDOWNS[className]
+                if spells then
+                    info = UIDropDownMenu_CreateInfo()
+                    info.text = className
+                    info.notCheckable = true
+                    info.hasArrow = true
+                    info.menuList = className
+                    UIDropDownMenu_AddButton(info, level)
+                end
+            end
+
+        elseif level == 2 then
+            -- Spells for the selected class
+            local className = menuList
+            local spells = addon.CLASS_COOLDOWNS[className]
+            if spells then
+                for _, spellID in ipairs(spells) do
+                    info = UIDropDownMenu_CreateInfo()
+                    local dbEntry = SPELL_DB and SPELL_DB[spellID]
+                    local spellName = dbEntry and dbEntry.name or (GetSpellInfo(spellID) or ("Spell " .. spellID))
+                    local texID = GetSpellTexture(spellID)
+                    if texID then
+                        info.text = "|T" .. texID .. ":14:14:0:0:64:64:4:60:4:60|t " .. spellName
+                    else
+                        info.text = spellName
+                    end
+                    info.checked = not hiddenCDs[spellID]
+                    info.isNotRadio = true
+                    info.keepShownOnClick = true
+                    local sid = spellID
+                    info.func = function(self, _, _, checked)
+                        if TrinketedHistoryDB and TrinketedHistoryDB.settings then
+                            if checked then
+                                TrinketedHistoryDB.settings.hiddenReplayCDs[sid] = nil
+                            else
+                                TrinketedHistoryDB.settings.hiddenReplayCDs[sid] = true
+                            end
+                        end
+                    end
+                    UIDropDownMenu_AddButton(info, level)
+                end
+            end
+        end
+    end
+
+    gearBtn:SetScript("OnClick", function(self)
+        UIDropDownMenu_Initialize(menuFrame, InitCDMenu, "MENU")
+        ToggleDropDownMenu(1, nil, menuFrame, self, 0, 0)
+    end)
 
     -- ===== UNIT FRAMES PANEL (left side) =====
     frame.unitPanel = CreateFrame("Frame", nil, frame)
@@ -350,7 +525,7 @@ local function CreateReplayFrame()
     -- Friendly unit frames (up to 5)
     frame.friendlyFrames = {}
     for i = 1, 5 do
-        frame.friendlyFrames[i] = CreateUnitFrame(frame.unitPanel, -20 - (i - 1) * (UNIT_FRAME_H + 4))
+        frame.friendlyFrames[i] = CreateUnitFrame(frame.unitPanel, -20 - (i - 1) * (UNIT_FRAME_H + 12))
         frame.friendlyFrames[i]:Hide()
     end
 
@@ -387,25 +562,52 @@ local function CreateReplayFrame()
 
     -- Filter chips using lib:CreateCheckbox() toggle chips with custom group logic
     frame.filterChips = {}
-    local filterNames = { "All", "CC", "Dmg", "Heal", "CDs", "Deaths", "Other" }
-    local filterCats = { "all", "cc", "damage", "healing", "cd", "death", "other" }
+    local filterNames = { "All", "Dmg", "Heal", "CD", "CC", "Die" }
+    local filterCats = { "all", "damage", "healing", "cd", "cc", "death" }
     frame.activeFilters = { all = true }
 
-    local chipX = 6
+    local CHIP_W = 42
+    local CHIP_H = 18
+    local chipX = 4
     for idx, label in ipairs(filterNames) do
         local cat = filterCats[idx]
-        local isOn = (cat == "all")  -- All starts active
+        local isOn = (cat == "all")
 
-        local function onToggle(newState)
+        local btn = CreateFrame("Button", nil, frame.feedPanel)
+        btn:SetSize(CHIP_W, CHIP_H)
+        btn:SetPoint("TOPLEFT", chipX, -4)
+
+        btn.bg = btn:CreateTexture(nil, "BACKGROUND")
+        btn.bg:SetAllPoints()
+
+        btn.label = btn:CreateFontString(nil, "OVERLAY")
+        btn.label:SetFont(lib.FONT_BODY, 9, "")
+        btn.label:SetPoint("CENTER")
+        btn.label:SetText(label)
+
+        btn.cat = cat
+        btn.isOn = isOn
+
+        local function UpdateChipVisual(b)
+            if b.isOn then
+                b.bg:SetColorTexture(C.accent[1], C.accent[2], C.accent[3], 0.15)
+                b.label:SetTextColor(C.accent[1], C.accent[2], C.accent[3])
+            else
+                b.bg:SetColorTexture(C.bgRaised[1], C.bgRaised[2], C.bgRaised[3], 1)
+                b.label:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
+            end
+        end
+        UpdateChipVisual(btn)
+
+        btn:SetScript("OnClick", function()
             if cat == "all" then
                 frame.activeFilters = { all = true }
             else
                 frame.activeFilters.all = nil
-                if newState then
+                if not frame.activeFilters[cat] then
                     frame.activeFilters[cat] = true
                 else
                     frame.activeFilters[cat] = nil
-                    -- If no filters active, re-enable All
                     local anyActive = false
                     for _, c in ipairs(filterCats) do
                         if c ~= "all" and frame.activeFilters[c] then anyActive = true; break end
@@ -415,18 +617,24 @@ local function CreateReplayFrame()
                     end
                 end
             end
-            -- Sync all chip visuals to match activeFilters state
             for _, chip in ipairs(frame.filterChips) do
-                local shouldBeOn = frame.activeFilters[chip.cat] or frame.activeFilters.all
-                chip.checkbox:SetChecked(shouldBeOn)
+                chip.isOn = frame.activeFilters[chip.cat] or frame.activeFilters.all
+                UpdateChipVisual(chip)
             end
             if frame.RefreshFeed then frame:RefreshFeed() end
-        end
+        end)
 
-        -- lib:CreateCheckbox returns the checkbox frame; position in feedPanel
-        local checkbox = lib:CreateCheckbox(frame.feedPanel, chipX, -6, label, isOn, onToggle)
-        frame.filterChips[idx] = { checkbox = checkbox, cat = cat }
-        chipX = chipX + (checkbox:GetWidth() or 40) + 4
+        btn:SetScript("OnEnter", function(self)
+            if self.isOn then
+                self.bg:SetColorTexture(C.accent[1], C.accent[2], C.accent[3], 0.25)
+            else
+                self.bg:SetColorTexture(C.bgElevated[1], C.bgElevated[2], C.bgElevated[3], 1)
+            end
+        end)
+        btn:SetScript("OnLeave", function(self) UpdateChipVisual(self) end)
+
+        frame.filterChips[idx] = btn
+        chipX = chipX + CHIP_W + 2
     end
 
     -- Search box
@@ -484,7 +692,7 @@ local function CreateReplayFrame()
     -- Jump to start
     local btnStart = CreateFrame("Button", nil, frame.transport)
     btnStart:SetSize(24, 20)
-    btnStart:SetPoint("LEFT", 4, 0)
+    btnStart:SetPoint("LEFT", 4, 6)
     btnStart.text = btnStart:CreateFontString(nil, "OVERLAY")
     btnStart.text:SetFont(lib.FONT_MONO, 10, "")
     btnStart.text:SetPoint("CENTER")
@@ -542,7 +750,7 @@ local function CreateReplayFrame()
     -- Timeline scrubber track
     frame.scrubTrack = CreateFrame("Button", nil, frame.transport)
     frame.scrubTrack:SetPoint("LEFT", frame.btnSpeed, "RIGHT", 10, 0)
-    frame.scrubTrack:SetPoint("RIGHT", frame.transport, "RIGHT", -70, 0)
+    frame.scrubTrack:SetPoint("RIGHT", frame.transport, "RIGHT", -100, 0)
     frame.scrubTrack:SetHeight(6)
 
     frame.scrubTrackBg = frame.scrubTrack:CreateTexture(nil, "BACKGROUND")
@@ -576,9 +784,31 @@ local function CreateReplayFrame()
     -- Time display
     frame.timeText = frame.transport:CreateFontString(nil, "OVERLAY")
     frame.timeText:SetFont(lib.FONT_MONO, 10, "")
-    frame.timeText:SetPoint("RIGHT", -4, 0)
+    frame.timeText:SetPoint("RIGHT", -4, 6)
     frame.timeText:SetJustifyH("RIGHT")
     frame.timeText:SetTextColor(C.textNormal[1], C.textNormal[2], C.textNormal[3])
+
+    -- ===== TIMELINE LEGEND =====
+    local legendItems = {
+        { color = CAT_COLORS.death,        label = "Death" },
+        { color = CAT_COLORS.trinket,      label = "Trinket" },
+        { color = CAT_COLORS.offensive_cd, label = "Offensive" },
+        { color = CAT_COLORS.defensive_cd, label = "Defensive" },
+        { color = CAT_COLORS.interrupt,    label = "Interrupt" },
+    }
+    local legendX = 4
+    for _, item in ipairs(legendItems) do
+        local swatch = frame.transport:CreateTexture(nil, "ARTWORK")
+        swatch:SetSize(8, 8)
+        swatch:SetPoint("BOTTOMLEFT", legendX, 4)
+        swatch:SetColorTexture(item.color.r, item.color.g, item.color.b, 1)
+        local lbl = frame.transport:CreateFontString(nil, "OVERLAY")
+        lbl:SetFont(lib.FONT_BODY, 8, "")
+        lbl:SetPoint("LEFT", swatch, "RIGHT", 3, 0)
+        lbl:SetText(item.label)
+        lbl:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
+        legendX = legendX + 8 + 3 + lbl:GetStringWidth() + 10
+    end
 
     -- ===== ERROR MESSAGE (shown when decompression fails) =====
     frame.errorText = frame:CreateFontString(nil, "OVERLAY")
@@ -649,7 +879,7 @@ local function CreateReplayFrame()
         local friendlyCount = math.min(#friendly, 5)
         for i = 1, 5 do
             if i <= friendlyCount then
-                self.friendlyFrames[i]:SetPoint("TOPLEFT", 10, -20 - (i - 1) * (UNIT_FRAME_H + 4))
+                self.friendlyFrames[i]:SetPoint("TOPLEFT", 10, -20 - (i - 1) * (UNIT_FRAME_H + 12))
                 UpdateUnitFrame(self.friendlyFrames[i], friendly[i].state,
                     session.currentTime, session.seeking)
             else
@@ -658,7 +888,7 @@ local function CreateReplayFrame()
         end
 
         -- Position divider and enemy label below friendly frames
-        local divY = -20 - friendlyCount * (UNIT_FRAME_H + 4) - 4
+        local divY = -20 - friendlyCount * (UNIT_FRAME_H + 12) - 4
         self.teamDivider:ClearAllPoints()
         self.teamDivider:SetPoint("TOPLEFT", self.unitPanel, "TOPLEFT", 10, divY)
         self.teamDivider:SetPoint("RIGHT", self.unitPanel, "RIGHT", -10, 0)
@@ -670,7 +900,7 @@ local function CreateReplayFrame()
         local enemyCount = math.min(#enemy, 5)
         for i = 1, 5 do
             if i <= enemyCount then
-                self.enemyFrames[i]:SetPoint("TOPLEFT", 10, enemyStartY - (i - 1) * (UNIT_FRAME_H + 4))
+                self.enemyFrames[i]:SetPoint("TOPLEFT", 10, enemyStartY - (i - 1) * (UNIT_FRAME_H + 12))
                 UpdateUnitFrame(self.enemyFrames[i], enemy[i].state,
                     session.currentTime, session.seeking)
             else
@@ -699,12 +929,13 @@ local function CreateReplayFrame()
                 show = true
             else
                 local cat = ev.cat
-                if cat == "cc" and filters.cc then show = true
+                if cat == "death" and filters.death then show = true
                 elseif cat == "damage" and filters.damage then show = true
-                elseif cat == "healing" and filters.healing then show = true
-                elseif (cat == "trinket" or cat == "offensive" or cat == "defensive") and filters.cd then show = true
-                elseif cat == "death" and filters.death then show = true
-                elseif (cat == "aura" or cat == "cast" or cat == "power" or cat == "other") and filters.other then show = true
+                elseif (cat == "healing" or cat == "healing_cd") and filters.healing then show = true
+                elseif (cat == "offensive_cd" or cat == "defensive_cd" or cat == "trinket"
+                    or cat == "racial" or cat == "cc_break" or cat == "mobility" or cat == "utility") and filters.cd then show = true
+                elseif (cat == "interrupt" or cat == "dispel" or cat == "aura") and filters.cc then show = true
+                elseif (cat == "cast" or cat == "miss" or cat == "power") and filters.damage then show = true
                 end
             end
             -- Apply search filter
@@ -714,7 +945,8 @@ local function CreateReplayFrame()
                 if ev.spellName and tostring(ev.spellName):lower():find(q, 1, true) then match = true end
                 if not match and ev.srcName and tostring(ev.srcName):lower():find(q, 1, true) then match = true end
                 if not match and ev.dstName and tostring(ev.dstName):lower():find(q, 1, true) then match = true end
-                if not match and ev.subevent and tostring(ev.subevent):lower():find(q, 1, true) then match = true end
+                if not match and ev.type and tostring(ev.type):lower():find(q, 1, true) then match = true end
+                if not match and ev.extraSpell and tostring(ev.extraSpell):lower():find(q, 1, true) then match = true end
                 if not match then show = false end
             end
             if show then
@@ -736,11 +968,43 @@ local function CreateReplayFrame()
                 row.bg:SetAllPoints()
                 row.bg:SetColorTexture(0, 0, 0, 0)
 
-                row.text = row:CreateFontString(nil, "OVERLAY")
-                row.text:SetFont(lib.FONT_MONO, 9, "")
-                row.text:SetPoint("LEFT", 2, 0)
-                row.text:SetPoint("RIGHT", -2, 0)
-                row.text:SetJustifyH("LEFT")
+                -- Time label
+                row.timeText = row:CreateFontString(nil, "OVERLAY")
+                row.timeText:SetFont(lib.FONT_MONO, 9, "")
+                row.timeText:SetPoint("LEFT", 2, 0)
+                row.timeText:SetWidth(38)
+                row.timeText:SetJustifyH("LEFT")
+
+                -- Source name
+                row.srcText = row:CreateFontString(nil, "OVERLAY")
+                row.srcText:SetFont(lib.FONT_MONO, 9, "")
+                row.srcText:SetPoint("LEFT", 42, 0)
+                row.srcText:SetWidth(80)
+                row.srcText:SetJustifyH("RIGHT")
+                row.srcText:SetWordWrap(false)
+
+                -- Spell icon button (separate frame for isolated tooltip)
+                row.iconBtn = CreateFrame("Button", nil, row)
+                row.iconBtn:SetSize(FEED_ICON_SIZE, FEED_ICON_SIZE)
+                row.iconBtn:SetPoint("LEFT", 126, 0)
+                row.icon = row.iconBtn:CreateTexture(nil, "ARTWORK")
+                row.icon:SetAllPoints()
+
+                -- Spell name
+                row.spellText = row:CreateFontString(nil, "OVERLAY")
+                row.spellText:SetFont(lib.FONT_MONO, 9, "")
+                row.spellText:SetPoint("LEFT", 144, 0)
+                row.spellText:SetWidth(120)
+                row.spellText:SetJustifyH("LEFT")
+                row.spellText:SetWordWrap(false)
+
+                -- Arrow + target + amount
+                row.detailText = row:CreateFontString(nil, "OVERLAY")
+                row.detailText:SetFont(lib.FONT_MONO, 9, "")
+                row.detailText:SetPoint("LEFT", 268, 0)
+                row.detailText:SetPoint("RIGHT", -2, 0)
+                row.detailText:SetJustifyH("LEFT")
+                row.detailText:SetWordWrap(false)
 
                 self.feedRows[idx] = row
             end
@@ -748,54 +1012,143 @@ local function CreateReplayFrame()
             row:SetPoint("TOPLEFT", 0, -((idx - 1) * FEED_ROW_H))
             row.eventTime = ev.time
 
-            -- Format the row text
-            local timeStr = FormatTimeTenths(ev.time)
-            local catColor = CAT_COLORS[ev.cat] or { r = 1, g = 1, b = 1 }
+            -- Time
+            row.timeText:SetText(FormatTimeTenths(ev.time))
+            row.timeText:SetTextColor(0.53, 0.53, 0.53)
+
+            -- Spell icon + tooltip only on icon hover
+            local spellID = ev.spellID
+            local texID = spellID and GetSpellTexture(spellID)
+            if texID then
+                row.icon:SetTexture(texID)
+                row.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+                row.iconBtn:Show()
+                row.iconBtn:SetScript("OnEnter", function(self)
+                    if spellID then
+                        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                        GameTooltip:SetSpellByID(spellID)
+                        GameTooltip:Show()
+                    end
+                end)
+                row.iconBtn:SetScript("OnLeave", function()
+                    GameTooltip:Hide()
+                end)
+                -- Icon click also seeks
+                row.iconBtn:SetScript("OnClick", function()
+                    if session then
+                        session:SeekTo(ev.time)
+                        session.status = "paused"
+                    end
+                end)
+            else
+                row.iconBtn:Hide()
+            end
+
+            -- Format source, detail text
+            local catColor = CAT_COLORS[ev.cat] or { r = 0.7, g = 0.7, b = 0.7 }
             local catHex = string.format("%02x%02x%02x",
                 catColor.r * 255, catColor.g * 255, catColor.b * 255)
 
-            local parts = { "|cff" .. catHex .. timeStr .. "|r" }
-
             if ev.cat == "death" then
-                table.insert(parts, " |cffff0000" .. (ev.dstName or "?") .. " died|r")
+                row.srcText:SetText("")
+                row.spellText:SetText("|cffff0000DEATH|r")
+                row.iconBtn:Hide()
+                row.detailText:SetText(ClassColorStr(ev.dstClass) .. (ev.dstName or "?") .. "|r")
+
+            elseif ev.type == "damage" then
+                row.srcText:SetText(ClassColorStr(ev.srcClass) .. (ev.srcName or "?") .. "|r")
+                row.spellText:SetText("|cff" .. catHex .. (ev.spellName or "?") .. "|r")
+                local detail = "> " .. ClassColorStr(ev.dstClass) .. (ev.dstName or "?") .. "|r"
+                if ev.amount then
+                    local amtStr = AbbrevNumber(ev.amount)
+                    if ev.critical then amtStr = amtStr .. "*" end
+                    detail = detail .. "  |cffff4444-" .. amtStr .. "|r"
+                end
+                row.detailText:SetText(detail)
+
+            elseif ev.type == "heal" or ev.type == "absorb" then
+                row.srcText:SetText(ClassColorStr(ev.srcClass) .. (ev.srcName or "?") .. "|r")
+                row.spellText:SetText("|cff" .. catHex .. (ev.spellName or "?") .. "|r")
+                local detail = ""
+                if ev.dstName and ev.dstName ~= ev.srcName then
+                    detail = "> " .. ClassColorStr(ev.dstClass) .. ev.dstName .. "|r"
+                end
+                if ev.amount then
+                    local amtStr = AbbrevNumber(ev.amount)
+                    if ev.critical then amtStr = amtStr .. "*" end
+                    if ev.type == "absorb" then
+                        detail = detail .. "  |cffffff00" .. amtStr .. " abs|r"
+                    else
+                        detail = detail .. "  |cff44ff44+" .. amtStr .. "|r"
+                    end
+                end
+                row.detailText:SetText(detail)
+
+            elseif ev.type == "interrupt" then
+                row.srcText:SetText(ClassColorStr(ev.srcClass) .. (ev.srcName or "?") .. "|r")
+                row.spellText:SetText("|cff" .. catHex .. (ev.spellName or "?") .. "|r")
+                local detail = ""
+                if ev.dstName then
+                    detail = "> " .. ClassColorStr(ev.dstClass) .. ev.dstName .. "|r"
+                end
+                if ev.extraSpell then
+                    detail = detail .. " |cff888888(" .. ev.extraSpell .. ")|r"
+                end
+                row.detailText:SetText(detail)
+
+            elseif ev.type == "dispel" or ev.type == "steal" then
+                row.srcText:SetText(ClassColorStr(ev.srcClass) .. (ev.srcName or "?") .. "|r")
+                local verb = ev.type == "steal" and "stole" or "dispelled"
+                row.spellText:SetText("|cff" .. catHex .. verb .. "|r")
+                local detail = ""
+                if ev.extraSpell then
+                    detail = "|cffffff00" .. ev.extraSpell .. "|r"
+                end
+                if ev.dstName then
+                    detail = detail .. " > " .. ClassColorStr(ev.dstClass) .. ev.dstName .. "|r"
+                end
+                row.detailText:SetText(detail)
+
+            elseif ev.type == "aura_applied" then
+                row.srcText:SetText(ClassColorStr(ev.dstClass) .. (ev.dstName or "?") .. "|r")
+                local prefix = (ev.auraType == "DEBUFF") and "|cffff6666+" or "|cff66ff66+"
+                row.spellText:SetText(prefix .. (ev.spellName or "?") .. "|r")
+                row.detailText:SetText("")
+
+            elseif ev.type == "aura_removed" then
+                row.srcText:SetText(ClassColorStr(ev.dstClass) .. (ev.dstName or "?") .. "|r")
+                local prefix = (ev.auraType == "DEBUFF") and "|cffff6666-" or "|cff66ff66-"
+                row.spellText:SetText(prefix .. (ev.spellName or "?") .. "|r")
+                row.detailText:SetText("")
+
+            elseif ev.type == "aura_break" then
+                row.srcText:SetText(ClassColorStr(ev.dstClass) .. (ev.dstName or "?") .. "|r")
+                row.spellText:SetText("|cffff8800" .. (ev.spellName or "?") .. "|r")
+                local detail = "|cffff8800broken|r"
+                if ev.extraSpell then
+                    detail = detail .. " |cff888888(by " .. ev.extraSpell .. ")|r"
+                end
+                row.detailText:SetText(detail)
+
+            elseif ev.type == "miss" then
+                row.srcText:SetText(ClassColorStr(ev.srcClass) .. (ev.srcName or "?") .. "|r")
+                row.spellText:SetText("|cff888888" .. (ev.spellName or "?") .. "|r")
+                row.detailText:SetText("> " .. ClassColorStr(ev.dstClass) .. (ev.dstName or "?") .. "|r" ..
+                    "  |cff888888" .. (ev.missType or "MISS") .. "|r")
+
             else
-                local spellStr = ev.spellName or "?"
-                -- Annotate aura removed / dispels / interrupts
-                if ev.subevent == "SPELL_AURA_REMOVED" then
-                    spellStr = spellStr .. " faded"
-                elseif ev.subevent == "SPELL_INTERRUPT" then
-                    spellStr = spellStr .. " interrupted"
-                elseif ev.subevent == "SPELL_DISPEL" then
-                    spellStr = spellStr .. " dispelled"
-                elseif ev.subevent == "SPELL_STOLEN" then
-                    spellStr = spellStr .. " stolen"
-                elseif ev.subevent == "SPELL_MISSED" then
-                    spellStr = spellStr .. " missed"
-                elseif ev.subevent == "SPELL_CAST_START" then
-                    spellStr = spellStr .. " casting"
+                -- cast_success, cast_start, summon, energize, drain, etc.
+                row.srcText:SetText(ClassColorStr(ev.srcClass) .. (ev.srcName or "?") .. "|r")
+                row.spellText:SetText("|cff" .. catHex .. (ev.spellName or "?") .. "|r")
+                local detail = ""
+                if ev.dstName and ev.dstName ~= ev.srcName then
+                    detail = "> " .. ClassColorStr(ev.dstClass) .. ev.dstName .. "|r"
                 end
-                if ev.srcClass then
-                    spellStr = ClassColorStr(ev.srcClass) .. spellStr .. "|r"
-                end
-                table.insert(parts, "  " .. spellStr)
-
-                if ev.srcName and ev.dstName then
-                    local src = ClassColorStr(ev.srcClass) .. ev.srcName .. "|r"
-                    local dst = ClassColorStr(ev.dstClass) .. ev.dstName .. "|r"
-                    table.insert(parts, "  " .. src .. " > " .. dst)
-                elseif ev.srcName then
-                    table.insert(parts, "  " .. ClassColorStr(ev.srcClass) .. ev.srcName .. "|r")
-                end
-
                 if ev.amount and ev.amount ~= 0 then
-                    table.insert(parts, "  " .. AbbrevNumber(math.abs(ev.amount)))
+                    detail = detail .. "  " .. AbbrevNumber(math.abs(ev.amount))
                 end
-                if ev.duration then
-                    table.insert(parts, "  " .. ev.duration .. "s")
-                end
+                row.detailText:SetText(detail)
             end
-
-            row.text:SetText(table.concat(parts))
 
             -- Click to seek
             row:SetScript("OnClick", function()
@@ -821,10 +1174,18 @@ local function CreateReplayFrame()
             if row:IsShown() and row.eventTime then
                 row.bg:SetColorTexture(0, 0, 0, 0)
                 if row.eventTime <= ct then
-                    row.text:SetAlpha(1.0)
+                    row.timeText:SetAlpha(1.0)
+                    row.srcText:SetAlpha(1.0)
+                    row.iconBtn:SetAlpha(1.0)
+                    row.spellText:SetAlpha(1.0)
+                    row.detailText:SetAlpha(1.0)
                     lastPastIdx = idx
                 else
-                    row.text:SetAlpha(0.3)
+                    row.timeText:SetAlpha(0.3)
+                    row.srcText:SetAlpha(0.3)
+                    row.iconBtn:SetAlpha(0.3)
+                    row.spellText:SetAlpha(0.3)
+                    row.detailText:SetAlpha(0.3)
                 end
             end
         end
@@ -853,8 +1214,12 @@ local function CreateReplayFrame()
         for i, marker in ipairs(session.markers) do
             local m = self.markerPool[i]
             if not m then
-                m = self.scrubTrack:CreateTexture(nil, "OVERLAY")
-                m:SetSize(2, 10)
+                m = CreateFrame("Button", nil, self.scrubTrack)
+                m:SetSize(6, 14)
+                m:SetFrameLevel(self.scrubTrack:GetFrameLevel() + 2)
+                m.tex = m:CreateTexture(nil, "OVERLAY")
+                m.tex:SetSize(2, 10)
+                m.tex:SetPoint("CENTER")
                 self.markerPool[i] = m
             end
             local frac = session.matchDuration > 0 and (marker.time / session.matchDuration) or 0
@@ -863,7 +1228,31 @@ local function CreateReplayFrame()
             m:SetPoint("CENTER", self.scrubTrack, "LEFT", trackW * frac, 0)
 
             local cc = CAT_COLORS[marker.cat] or { r = 1, g = 1, b = 1 }
-            m:SetColorTexture(cc.r, cc.g, cc.b, 0.8)
+            m.tex:SetColorTexture(cc.r, cc.g, cc.b, 0.8)
+
+            -- Tooltip on hover
+            local label = marker.label or "?"
+            local playerName = marker.player or ""
+            local timeStr = FormatTime(marker.time)
+            m:SetScript("OnEnter", function(self)
+                GameTooltip:SetOwner(self, "ANCHOR_TOP")
+                GameTooltip:SetText(label, cc.r, cc.g, cc.b)
+                if playerName ~= "" then
+                    GameTooltip:AddLine(playerName, 1, 1, 1)
+                end
+                GameTooltip:AddLine(timeStr, 0.6, 0.6, 0.6)
+                GameTooltip:Show()
+            end)
+            m:SetScript("OnLeave", function()
+                GameTooltip:Hide()
+            end)
+            -- Click to seek
+            m:SetScript("OnClick", function()
+                if session then
+                    session:SeekTo(marker.time)
+                    session.status = "paused"
+                end
+            end)
             m:Show()
         end
     end
@@ -877,6 +1266,8 @@ end
 ---------------------------------------------------------------------------
 function addon:OpenReplay(game)
     local frame = CreateReplayFrame()
+    frame:SetFrameStrata("DIALOG")
+    frame:Raise()
 
     -- Clean up previous session
     if session then
@@ -895,7 +1286,7 @@ function addon:OpenReplay(game)
     frame.transport:Show()
 
     -- Try to load
-    if not game.gameLog then
+    if not game.eventLog then
         frame.errorText:SetText("No game log recorded for this match.")
         frame.errorText:Show()
         frame.unitPanel:Hide()
@@ -905,7 +1296,7 @@ function addon:OpenReplay(game)
         return
     end
 
-    local newSession, err = self:CreateReplaySession(game.gameLog)
+    local newSession, err = self:CreateReplaySession(game.eventLog)
     if not newSession then
         frame.errorText:SetText(err or "Failed to load replay data.")
         frame.errorText:Show()
@@ -927,7 +1318,13 @@ function addon:OpenReplay(game)
     -- Reset filter chips
     frame.activeFilters = { all = true }
     for _, chip in ipairs(frame.filterChips) do
-        chip.checkbox:SetChecked(true)
+        chip.isOn = chip.cat == "all" or true
+        if chip.bg and chip.label then
+            if chip.isOn then
+                chip.bg:SetColorTexture(C.accent[1], C.accent[2], C.accent[3], 0.15)
+                chip.label:SetTextColor(C.accent[1], C.accent[2], C.accent[3])
+            end
+        end
     end
 
     -- Reset search box
